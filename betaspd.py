@@ -1,23 +1,5 @@
 # =============================================================
-#  LUCI SPORT 4.5
-#  - Integración SofaScore (xG, forma, H2H)
-#  - Config desde .env / st.secrets
-#  - Cálculo de edge (cuota justa vs cuota real)
-#  - Persistencia opcional (persistir=True/False)
-#  - Timestamps en UTC
-#  - hash() determinista (compatible entre procesos)
-#  - Submenú de combinadas: manual y automática por cuota objetivo
-#  - Filtro estricto: cuota >= 1.50 y prob >= 55% en cada pata
-#  - Evita correlaciones y repetición de partidos
-#  - Mercados: h2h, totals (plan free de The Odds API)
-#  - Rotación entre 2 API keys de The Odds API
-#  - Tarjetas con default variable por equipo
-#  - Envío automático de picks a Telegram
-#  - Excel con una hoja POR EQUIPO (auto-actualizada)
-#  - Auto-resolución de apuestas contra la API
-#  - Calibración por rendimiento histórico por mercado
-#  - Backtest de partidos pasados
-#  - Migración automática de BD
+#  LUCI SPORT 4.5 — versión unificada
 # =============================================================
 import os, math, time, sqlite3, requests, json, hashlib
 from datetime import datetime, timedelta, timezone
@@ -29,7 +11,6 @@ try:
 except ImportError:
     EXCEL_OK = False
 
-# ---------- CONFIGURACIÓN (desde config.py) ----------
 from config import (
     FOOTBALL_API_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID,
     ODDS_API_KEYS, HEADERS,
@@ -56,7 +37,6 @@ FACTOR_CALIB_MAX   = 1.15
 LINEAS        = [0.5, 1.5, 2.5, 3.5, 4.5]
 LINEAS_EQUIPO = [0.5, 1.5, 2.5]
 
-# ---------- COLORES ----------
 G, Y, R, B, C, W = '\033[92m','\033[93m','\033[91m','\033[94m','\033[96m','\033[0m'
 BOLD = '\033[1m'
 
@@ -126,20 +106,15 @@ def migrate_db():
     cur.execute("PRAGMA table_info(predictions)")
     cols = [r[1] for r in cur.fetchall()]
     nuevos = [
-        ("liga",        "TEXT"),
-        ("match_date",  "TEXT"),
-        ("home_id",     "INTEGER"),
-        ("away_id",     "INTEGER"),
-        ("ft_home",     "INTEGER"),
-        ("ft_away",     "INTEGER"),
-        ("resolved_at", "TEXT"),
-        ("cuota_real",  "REAL"),
-        ("edge_pct",    "REAL"),
+        ("liga", "TEXT"), ("match_date", "TEXT"),
+        ("home_id", "INTEGER"), ("away_id", "INTEGER"),
+        ("ft_home", "INTEGER"), ("ft_away", "INTEGER"),
+        ("resolved_at", "TEXT"), ("cuota_real", "REAL"),
+        ("edge_pct", "REAL"),
     ]
     for col, tipo in nuevos:
         if col not in cols:
             cur.execute(f"ALTER TABLE predictions ADD COLUMN {col} {tipo}")
-            print(f"{G}[MIGRACIÓN] Columna '{col}' añadida.{W}")
     con.commit(); con.close()
 
 
@@ -316,40 +291,34 @@ def update_market_performance(market, result):
 # =============================================================
 def enviar_a_telegram(mensaje):
     if not TELEGRAM_TOKEN or "PON_AQUI" in str(TELEGRAM_TOKEN):
-        print(f"{Y}[TELEGRAM] Token no configurado.{W}")
         return False
     if not TELEGRAM_CHAT_ID or "PON_AQUI" in str(TELEGRAM_CHAT_ID):
-        print(f"{Y}[TELEGRAM] Chat ID no configurado.{W}")
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
     try:
         r = requests.post(url, json=payload, timeout=15)
-        data = r.json()
-        if not data.get("ok"):
-            print(f"{R}[TELEGRAM] Error: {data.get('description','desconocido')}{W}")
-            return False
-        return True
-    except requests.RequestException as e:
-        print(f"{R}[TELEGRAM] Red: {e}{W}")
-        return False
-    except ValueError:
-        print(f"{R}[TELEGRAM] Respuesta no-JSON.{W}")
+        return r.json().get("ok", False)
+    except Exception:
         return False
 
 
 # =============================================================
-#  5. DATOS DE API (football-data.org)
+#  5. DATOS DE API (football-data.org) — RATE LIMIT REDUCIDO
 # =============================================================
 _LAST_CALL = [0.0]
-def _rate_limit(min_interval=6.5):
+
+
+def _rate_limit(min_interval=1.5):
+    """Rate limit reducido a 1.5s. Con caché persistente solo se llama
+    1 vez por equipo cada 12h, así que no agotamos la API."""
     elapsed = time.time() - _LAST_CALL[0]
-    if elapsed < min_interval: time.sleep(min_interval - elapsed)
+    if elapsed < min_interval:
+        time.sleep(min_interval - elapsed)
     _LAST_CALL[0] = time.time()
 
 
 def _default_cards(team_id):
-    """Default determinista — usa hashlib, no hash() (que varía por proceso)."""
     h = int(hashlib.md5(str(team_id).encode()).hexdigest(), 16)
     return round(1.6 + (h % 13) * 0.1, 2)
 
@@ -411,7 +380,7 @@ def get_cards_data(team_id):
 
 
 # =============================================================
-#  5b. CUOTAS REALES (The Odds API con rotación de keys)
+#  5b. CUOTAS REALES (The Odds API)
 # =============================================================
 _ODDS_CACHE = {}
 
@@ -450,9 +419,7 @@ def _rotate_odds_key(current_idx):
         nxt = (current_idx + i) % len(ODDS_API_KEYS)
         if not ODDS_KEY_DEAD[nxt]:
             ODDS_KEY_INDEX[0] = nxt
-            print(f"{Y}[ODDS-API] Key #{current_idx+1} agotada. Rotando a #{nxt+1}.{W}")
             return True
-    print(f"{R}[ODDS-API] TODAS las keys agotadas.{W}")
     return False
 
 
@@ -501,23 +468,18 @@ def _fetch_odds_liga(sport_key):
             return []
 
         if r.status_code != 200:
-            print(f"{Y}[ODDS-API] Error {r.status_code}: {r.text[:150]}{W}")
             _ODDS_CACHE[sport_key] = (ahora, [])
             return []
 
         datos = r.json()
         _ODDS_CACHE[sport_key] = (ahora, datos)
-        print(f"{G}[ODDS-API] {sport_key}: {len(datos)} partidos | "
-              f"Key #{idx+1} | Restantes: {restantes}{W}")
         return datos
-    except Exception as e:
-        print(f"{Y}[ODDS-API] Red: {e}{W}")
+    except Exception:
         _ODDS_CACHE[sport_key] = (ahora, [])
         return []
 
 
 def get_cuotas_reales(match):
-    """Devuelve {mercado: {selección: cuota_promedio}} o {} si no hay datos."""
     if not ODDS_API_KEYS:
         return {}
     liga = match.get("league_code", "")
@@ -563,4 +525,48 @@ def get_cuotas_reales(match):
                         cuotas_h2h["draw"].append(float(price))
                     elif nm == home_api:
                         cuotas_h2h["home"].append(float(price))
-                    e
+                    elif nm == away_api:
+                        cuotas_h2h["away"].append(float(price))
+            elif key == "totals":
+                for o in mkt.get("outcomes", []):
+                    pt = str(o.get("point", "")).strip()
+                    nm = o.get("name", "")
+                    price = o.get("price")
+                    if not price or not pt: continue
+                    cuotas_ou.setdefault(pt, {"Over": [], "Under": []})
+                    if nm in ("Over", "Under"):
+                        cuotas_ou[pt][nm].append(float(price))
+
+    def _avg(lst):
+        return round(sum(lst)/len(lst), 2) if lst else 0
+
+    resultado = {"1X2": {}, "Goles totales": {}}
+    if cuotas_h2h["home"]:
+        resultado["1X2"]["Gana " + home] = _avg(cuotas_h2h["home"])
+    if cuotas_h2h["away"]:
+        resultado["1X2"]["Gana " + away] = _avg(cuotas_h2h["away"])
+    if cuotas_h2h["draw"]:
+        resultado["1X2"]["Empate"] = _avg(cuotas_h2h["draw"])
+    for pt, d in cuotas_ou.items():
+        if d["Over"]:  resultado["Goles totales"]["+" + pt] = _avg(d["Over"])
+        if d["Under"]: resultado["Goles totales"]["-" + pt] = _avg(d["Under"])
+
+    return {k: v for k, v in resultado.items() if v}
+
+
+# =============================================================
+#  6. AUTO-RESOLUCIÓN
+# =============================================================
+def evaluar_seleccion(market, selection, home_name, away_name, ft_h, ft_a, ht_h, ht_a):
+    sel = selection
+    total = ft_h + ft_a
+
+    if market == "BTTS":
+        return "WON" if (ft_h > 0 and ft_a > 0) else "LOST"
+
+    if market == "1X2":
+        if sel.startswith("Gana "):
+            team = sel[5:].strip()
+            if team == home_name: return "WON" if ft_h > ft_a else "LOST"
+            if team == away_name: return "WON" if ft_a > ft_h else "LOST"
+        if sel.startswith("1X "): return "WON" if ft_h >= ft_a els
