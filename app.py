@@ -1,10 +1,10 @@
-"""LuciSport AI — Streamlit unificado."""
+"""LuciSport AI — Streamlit sin SofaScore."""
+import json
 import streamlit as st
 import requests
 from datetime import datetime, timedelta, timezone
 
 from config import HEADERS
-from sofascore_integration import enriquecer_partido
 from ai_analyst import analizar_partido_con_ia
 
 import betaspd as L
@@ -39,6 +39,7 @@ if "pendientes" not in st.session_state:
     st.session_state.pendientes = []
 
 
+# ---------- FUNCIONES CACHEADAS ----------
 @st.cache_data(ttl=1800, show_spinner=False)
 def cargar_partidos(codigo: str, dias: int = 5):
     ahora = datetime.now(timezone.utc)
@@ -55,54 +56,42 @@ def cargar_partidos(codigo: str, dias: int = 5):
         return []
 
 
-def analizar_partido(match, usar_ia=True):
+@st.cache_data(ttl=600, show_spinner=False)
+def analizar_partido_cacheado(match_json: str, usar_ia: bool = False):
+    """Analiza un partido. Cacheado 10 min."""
+    match = json.loads(match_json)
     try:
-        home = match['homeTeam']['name']
-        away = match['awayTeam']['name']
-
-        st.write(f"   📊 Cargando datos de **{home}** y **{away}**...")
         picks = L.analizar_titan(
             match, solo_picks=True,
             notificar_telegram=False, persistir=False,
         )
-
-        sofa = None
-        st.write(f"   🔍 Consultando SofaScore...")
-        try:
-            sofa = enriquecer_partido(match)
-            if sofa and sofa.get("ok"):
-                st.write(f"   ✅ SofaScore OK")
-            else:
-                st.write(f"   ⚠️ SofaScore sin datos")
-        except Exception as e:
-            st.write(f"   ⚠️ SofaScore falló: {e}")
-
-        ia = None
-        if usar_ia and picks:
-            st.write(f"   🧠 Consultando IA...")
-            try:
-                ia = analizar_partido_con_ia(match, picks, sofa)
-                if ia:
-                    st.write(f"   ✅ IA respondió")
-            except Exception as e:
-                st.write(f"   ⚠️ IA falló: {e}")
-
-        return {
-            "partido": f"{home} vs {away}",
-            "fecha": (match.get('utcDate') or '')[:16],
-            "liga": match.get('league_code', ''),
-            "picks": picks,
-            "sofascore": sofa,
-            "ia": ia,
-        }
     except Exception as e:
-        st.warning(f"Error analizando {match['homeTeam']['name']}: {e}")
-        return None
+        return {"error": str(e), "picks": [], "partido": "error"}
+
+    ia = None
+    if usar_ia and picks:
+        try:
+            ia = analizar_partido_con_ia(match, picks, None)
+        except Exception:
+            pass
+
+    return {
+        "partido": f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
+        "fecha": (match.get('utcDate') or '')[:16],
+        "liga": match.get('league_code', ''),
+        "picks": picks,
+        "ia": ia,
+    }
 
 
+def analizar_partido(match, usar_ia=True):
+    return analizar_partido_cacheado(json.dumps(match), usar_ia)
+
+
+# ---------- SIDEBAR ----------
 with st.sidebar:
     st.title("⚽ LuciSport AI")
-    st.caption("Análisis deportivo con IA")
+    st.caption("Modelo Dixon-Coles + Groq IA")
 
     liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
     dias = st.slider("Días a futuro", 1, 14, 5)
@@ -144,12 +133,16 @@ with st.sidebar:
             st.rerun()
 
 
+# ---------- CUERPO ----------
 st.title("⚽ LuciSport AI")
-st.caption("Modelo Dixon-Coles + SofaScore + Groq Llama 3.3")
+st.caption("Modelo Dixon-Coles + Groq Llama 3.3")
 
 tab1, tab2 = st.tabs(["📅 Partidos y análisis", "📊 Resultados"])
 
 
+# ============================================================
+# TAB 1
+# ============================================================
 with tab1:
     partidos = st.session_state.partidos
 
@@ -183,25 +176,17 @@ with tab1:
 
         pendientes = st.session_state.pendientes
         if pendientes:
-            with st.status(f"Analizando {len(pendientes)} partido(s)...",
-                           expanded=True) as status:
-                resultados = []
-                for idx in pendientes:
-                    if idx >= len(partidos):
-                        continue
-                    match = partidos[idx]
-                    st.write(f"🔍 **{match['homeTeam']['name']} vs "
-                             f"{match['awayTeam']['name']}**")
+            st.info(f"⏳ Procesando {len(pendientes)} partido(s) — espera unos segundos...")
+            resultados = []
+            for idx in pendientes:
+                if idx >= len(partidos):
+                    continue
+                match = partidos[idx]
+                with st.spinner(f"Analizando {match['homeTeam']['name']} vs "
+                                f"{match['awayTeam']['name']}..."):
                     res = analizar_partido(match, usar_ia=usar_ia)
                     if res:
                         resultados.append(res)
-                        st.write(f"   ✅ {len(res['picks'])} picks generados")
-
-                status.update(
-                    label=f"✅ {len(resultados)} partido(s) analizados",
-                    state="complete",
-                )
-
             st.session_state.analisis = resultados
             st.session_state.pendientes = []
             st.rerun()
@@ -220,7 +205,8 @@ with tab1:
                     with c1:
                         st.markdown("#### 📈 Picks del modelo")
                         if not analisis["picks"]:
-                            st.caption("Ningún pick supera los filtros")
+                            st.caption("Ningún pick supera los filtros "
+                                       "(prob ≥55% y cuota ≥1.50)")
                         for j, p in enumerate(analisis["picks"]):
                             with st.container(border=True):
                                 st.write(f"**{p['market']}**")
@@ -244,7 +230,8 @@ with tab1:
                         st.markdown("#### 🧠 Análisis IA")
                         ia = analisis.get("ia")
                         if not ia:
-                            st.caption("Sin análisis IA (configura GROQ_API_KEY)")
+                            st.caption("Sin análisis IA "
+                                       "(configura GROQ_API_KEY en Secrets)")
                         else:
                             st.info(ia.get("analisis", ""))
                             st.write(f"**Pick IA:** {ia.get('pick_recomendado', '-')}")
@@ -253,29 +240,10 @@ with tab1:
                             if ia.get("riesgos"):
                                 st.warning("⚠️ " + " · ".join(ia["riesgos"]))
 
-                    sofa = analisis.get("sofascore") or {}
-                    if sofa.get("home_stats") or sofa.get("away_stats"):
-                        st.markdown("#### 📊 SofaScore (últimos 10)")
-                        sc1, sc2 = st.columns(2)
-                        for col, key, label in [
-                            (sc1, "home_stats", "Local"),
-                            (sc2, "away_stats", "Visita"),
-                        ]:
-                            s = sofa.get(key)
-                            if s:
-                                with col:
-                                    st.markdown(f"**{s['team_name']}** ({label})")
-                                    m1, m2 = st.columns(2)
-                                    m1.metric("GF", s["goles_favor_prom"])
-                                    m2.metric("GC", s["goles_contra_prom"])
-                                    forma_str = " ".join(
-                                        "🟢" if c == "W" else
-                                        "🔴" if c == "L" else "⚪"
-                                        for c in s["forma"][-5:]
-                                    )
-                                    st.write(f"Forma: {forma_str}")
 
-
+# ============================================================
+# TAB 2
+# ============================================================
 with tab2:
     st.subheader("🧾 Boleto actual")
 
