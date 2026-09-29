@@ -1,8 +1,16 @@
 """LuciSport AI — Supabase edition."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
-from st_supabase_connection import SupabaseConnection
+from supabase import create_client
 
+@st.cache_resource(ttl=600, show_spinner=False)
+def get_supabase():
+    url = _get("SUPABASE_URL")
+    key = _get("SUPABASE_KEY")
+    if not url or not key:
+        st.error("⚠️ Faltan SUPABASE_URL o SUPABASE_KEY en los Secrets")
+        st.stop()
+    return create_client(url, key)
 
 # ============================================================
 #  CONFIGURACIÓN
