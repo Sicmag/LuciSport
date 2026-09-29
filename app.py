@@ -314,7 +314,7 @@ with st.sidebar:
             st.rerun()
 
 st.title("⚽ LuciSport AI")
-st.caption("Dixon-Coles + Groq")
+st.caption("Dixon-Coles + Groq + Odds API")
 
 t1, t2 = st.tabs(["📅 Partidos", "📊 Boleto"])
 
@@ -378,14 +378,28 @@ with t1:
                     for j, p in enumerate(a["picks"]):
                         with st.container(border=True):
                             st.write(f"**{p['market']}** — {p['selection']}")
-                            x1, x2 = st.columns(2)
+                            x1, x2, x3 = st.columns(3)
                             x1.metric("Prob", f"{p['prob']}%")
-                            x2.metric("Cuota", f"{p['fair_odd']:.2f}")
+                            x2.metric("Cuota justa", f"{p['fair_odd']:.2f}",
+                                      help="Lo que el modelo cree que vale")
+                            cr = p.get("cuota_real")
+                            if cr:
+                                edge = p.get("edge_%", 0)
+                                x3.metric("Cuota real", f"{cr:.2f}",
+                                          delta=f"{edge:+.1f}%",
+                                          help="Cuota de casas + edge (valor esperado)")
+                            else:
+                                x3.metric("Cuota real", "—",
+                                          help="Sin datos de Odds API (partido fuera de ventana o liga sin cobertura)")
+                            if cr and p.get("edge_%", 0) > 5:
+                                st.success(f"✅ VALUE BET: +{p['edge_%']:.1f}% sobre cuota justa")
+                            elif cr and p.get("edge_%", 0) < -5:
+                                st.warning(f"⚠️ Cuota baja: {p['edge_%']:.1f}% bajo cuota justa")
                             if st.button("➕ Boleto", key=f"a_{a['partido']}_{j}"):
                                 st.session_state.boleto.append({
                                     "partido": a["partido"],
                                     "seleccion": p["selection"],
-                                    "cuota": p["fair_odd"],
+                                    "cuota": cr if cr else p["fair_odd"],
                                 })
                                 st.toast(f"Añadido: {p['selection']}")
                 with c2:
