@@ -1,7 +1,4 @@
-"""
-LuciSport AI — Frontend Streamlit.
-Compatible con Streamlit Community Cloud + móvil.
-"""
+"""LuciSport AI — Streamlit unificado."""
 import streamlit as st
 import requests
 from datetime import datetime, timedelta, timezone
@@ -14,16 +11,13 @@ import betaspd as L
 L.MODO_SILENCIOSO = True
 
 
-# ---------- CONFIGURACIÓN DE PÁGINA ----------
 st.set_page_config(
     page_title="LuciSport AI",
     page_icon="⚽",
     layout="wide",
-    initial_sidebar_state="collapsed",  # en móvil arranca cerrado
+    initial_sidebar_state="collapsed",
 )
 
-
-# ---------- LIGAS ----------
 LIGAS = {
     "Premier League": "PL",
     "La Liga":        "PD",
@@ -35,8 +29,6 @@ LIGAS = {
     "Libertadores":   "CLI",
 }
 
-
-# ---------- ESTADO DE SESIÓN ----------
 if "partidos" not in st.session_state:
     st.session_state.partidos = []
 if "analisis" not in st.session_state:
@@ -47,7 +39,6 @@ if "pendientes" not in st.session_state:
     st.session_state.pendientes = []
 
 
-# ---------- FUNCIONES ----------
 @st.cache_data(ttl=1800, show_spinner=False)
 def cargar_partidos(codigo: str, dias: int = 5):
     ahora = datetime.now(timezone.utc)
@@ -66,16 +57,38 @@ def cargar_partidos(codigo: str, dias: int = 5):
 
 def analizar_partido(match, usar_ia=True):
     try:
+        home = match['homeTeam']['name']
+        away = match['awayTeam']['name']
+
+        st.write(f"   📊 Cargando datos de **{home}** y **{away}**...")
         picks = L.analizar_titan(
             match, solo_picks=True,
             notificar_telegram=False, persistir=False,
         )
-        sofa = enriquecer_partido(match)
+
+        sofa = None
+        st.write(f"   🔍 Consultando SofaScore...")
+        try:
+            sofa = enriquecer_partido(match)
+            if sofa and sofa.get("ok"):
+                st.write(f"   ✅ SofaScore OK")
+            else:
+                st.write(f"   ⚠️ SofaScore sin datos")
+        except Exception as e:
+            st.write(f"   ⚠️ SofaScore falló: {e}")
+
         ia = None
         if usar_ia and picks:
-            ia = analizar_partido_con_ia(match, picks, sofa)
+            st.write(f"   🧠 Consultando IA...")
+            try:
+                ia = analizar_partido_con_ia(match, picks, sofa)
+                if ia:
+                    st.write(f"   ✅ IA respondió")
+            except Exception as e:
+                st.write(f"   ⚠️ IA falló: {e}")
+
         return {
-            "partido": f"{match['homeTeam']['name']} vs {match['awayTeam']['name']}",
+            "partido": f"{home} vs {away}",
             "fecha": (match.get('utcDate') or '')[:16],
             "liga": match.get('league_code', ''),
             "picks": picks,
@@ -87,7 +100,6 @@ def analizar_partido(match, usar_ia=True):
         return None
 
 
-# ---------- SIDEBAR ----------
 with st.sidebar:
     st.title("⚽ LuciSport AI")
     st.caption("Análisis deportivo con IA")
@@ -95,7 +107,7 @@ with st.sidebar:
     liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
     dias = st.slider("Días a futuro", 1, 14, 5)
     usar_ia = st.toggle("Análisis con IA (Groq)", value=False)
-    max_analizar = st.slider("Máx. partidos a analizar", 1, 10, 3)
+    max_analizar = st.slider("Máx. partidos a analizar", 1, 5, 1)
 
     st.divider()
 
@@ -132,16 +144,12 @@ with st.sidebar:
             st.rerun()
 
 
-# ---------- CUERPO ----------
 st.title("⚽ LuciSport AI")
 st.caption("Modelo Dixon-Coles + SofaScore + Groq Llama 3.3")
 
 tab1, tab2 = st.tabs(["📅 Partidos y análisis", "📊 Resultados"])
 
 
-# ============================================================
-# TAB 1 — PARTIDOS Y ANÁLISIS
-# ============================================================
 with tab1:
     partidos = st.session_state.partidos
 
@@ -164,7 +172,7 @@ with tab1:
             "Elige partidos para analizar",
             list(opciones.keys())[:30],
             max_selections=max_analizar,
-            placeholder="Selecciona hasta {} partidos".format(max_analizar),
+            placeholder=f"Selecciona hasta {max_analizar} partido(s)",
         )
 
         if st.button("🔍 Analizar seleccionados", type="primary"):
@@ -173,7 +181,6 @@ with tab1:
             else:
                 st.session_state.pendientes = [opciones[s] for s in seleccionados]
 
-        # --- Procesar análisis pendiente ---
         pendientes = st.session_state.pendientes
         if pendientes:
             with st.status(f"Analizando {len(pendientes)} partido(s)...",
@@ -183,8 +190,8 @@ with tab1:
                     if idx >= len(partidos):
                         continue
                     match = partidos[idx]
-                    st.write(f"🔍 {match['homeTeam']['name']} vs "
-                             f"{match['awayTeam']['name']}")
+                    st.write(f"🔍 **{match['homeTeam']['name']} vs "
+                             f"{match['awayTeam']['name']}**")
                     res = analizar_partido(match, usar_ia=usar_ia)
                     if res:
                         resultados.append(res)
@@ -199,7 +206,6 @@ with tab1:
             st.session_state.pendientes = []
             st.rerun()
 
-        # --- Mostrar análisis ---
         if not st.session_state.pendientes and st.session_state.analisis:
             for analisis in st.session_state.analisis:
                 with st.container(border=True):
@@ -247,7 +253,6 @@ with tab1:
                             if ia.get("riesgos"):
                                 st.warning("⚠️ " + " · ".join(ia["riesgos"]))
 
-                    # SofaScore
                     sofa = analisis.get("sofascore") or {}
                     if sofa.get("home_stats") or sofa.get("away_stats"):
                         st.markdown("#### 📊 SofaScore (últimos 10)")
@@ -271,9 +276,6 @@ with tab1:
                                     st.write(f"Forma: {forma_str}")
 
 
-# ============================================================
-# TAB 2 — RESULTADOS / BOLETO
-# ============================================================
 with tab2:
     st.subheader("🧾 Boleto actual")
 
@@ -297,12 +299,7 @@ with tab2:
 
         st.divider()
 
-        stake = st.number_input(
-            "Importe a apostar",
-            min_value=1.0,
-            value=10.0,
-            step=1.0,
-        )
+        stake = st.number_input("Importe a apostar", min_value=1.0, value=10.0, step=1.0)
         ganancia = stake * cuota_total
         st.success(f"💰 Ganancia potencial: **{ganancia:.2f}**")
 
