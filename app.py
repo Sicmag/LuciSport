@@ -1,6 +1,6 @@
 """
-LuciSport AI — Streamlit
-Compatible con Streamlit Community Cloud.
+LuciSport AI — Frontend Streamlit.
+Compatible con Streamlit Community Cloud + móvil.
 """
 import streamlit as st
 import requests
@@ -10,16 +10,20 @@ from config import HEADERS
 from sofascore_integration import enriquecer_partido
 from ai_analyst import analizar_partido_con_ia
 
-# Silenciar logs de betaspd
 import betaspd as L
 L.MODO_SILENCIOSO = True
 
+
+# ---------- CONFIGURACIÓN DE PÁGINA ----------
 st.set_page_config(
     page_title="LuciSport AI",
     page_icon="⚽",
     layout="wide",
+    initial_sidebar_state="collapsed",  # en móvil arranca cerrado
 )
 
+
+# ---------- LIGAS ----------
 LIGAS = {
     "Premier League": "PL",
     "La Liga":        "PD",
@@ -32,11 +36,15 @@ LIGAS = {
 }
 
 
-# ---------- ESTADO ----------
+# ---------- ESTADO DE SESIÓN ----------
+if "partidos" not in st.session_state:
+    st.session_state.partidos = []
 if "analisis" not in st.session_state:
     st.session_state.analisis = []
 if "boleto" not in st.session_state:
     st.session_state.boleto = []
+if "pendientes" not in st.session_state:
+    st.session_state.pendientes = []
 
 
 # ---------- FUNCIONES ----------
@@ -45,7 +53,7 @@ def cargar_partidos(codigo: str, dias: int = 5):
     ahora = datetime.now(timezone.utc)
     url = (f"https://api.football-data.org/v4/competitions/{codigo}/matches"
            f"?dateFrom={ahora.strftime('%Y-%m-%d')}"
-           f"&dateTo={(ahora+timedelta(days=dias)).strftime('%Y-%m-%d')}")
+           f"&dateTo={(ahora + timedelta(days=dias)).strftime('%Y-%m-%d')}")
     try:
         r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code != 200:
@@ -58,8 +66,10 @@ def cargar_partidos(codigo: str, dias: int = 5):
 
 def analizar_partido(match, usar_ia=True):
     try:
-        picks = L.analizar_titan(match, solo_picks=True,
-                                  notificar_telegram=False, persistir=False)
+        picks = L.analizar_titan(
+            match, solo_picks=True,
+            notificar_telegram=False, persistir=False,
+        )
         sofa = enriquecer_partido(match)
         ia = None
         if usar_ia and picks:
@@ -84,11 +94,21 @@ with st.sidebar:
 
     liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
     dias = st.slider("Días a futuro", 1, 14, 5)
-    usar_ia = st.toggle("Análisis con IA (Groq)", value=True)
+    usar_ia = st.toggle("Análisis con IA (Groq)", value=False)
     max_analizar = st.slider("Máx. partidos a analizar", 1, 10, 3)
 
     st.divider()
+
+    if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
+        with st.spinner("Cargando partidos..."):
+            st.session_state.partidos = cargar_partidos(LIGAS[liga_nombre], dias)
+            st.session_state.analisis = []
+            st.session_state.pendientes = []
+        st.rerun()
+
+    st.divider()
     st.subheader("🧾 Boleto")
+
     if not st.session_state.boleto:
         st.caption("Sin selecciones")
     else:
@@ -111,11 +131,6 @@ with st.sidebar:
             st.session_state.boleto = []
             st.rerun()
 
-    st.divider()
-    if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
-        st.session_state.partidos = cargar_partidos(LIGAS[liga_nombre], dias)
-        st.session_state.analisis = []
-
 
 # ---------- CUERPO ----------
 st.title("⚽ LuciSport AI")
@@ -123,12 +138,19 @@ st.caption("Modelo Dixon-Coles + SofaScore + Groq Llama 3.3")
 
 tab1, tab2 = st.tabs(["📅 Partidos y análisis", "📊 Resultados"])
 
+
+# ============================================================
+# TAB 1 — PARTIDOS Y ANÁLISIS
+# ============================================================
 with tab1:
-    partidos = st.session_state.get("partidos", [])
+    partidos = st.session_state.partidos
+
     if not partidos:
-        st.info("👈 Selecciona una liga y pulsa **Cargar partidos**")
+        st.info("👈 Abre el menú lateral (» arriba izquierda), "
+                "elige liga y pulsa **Cargar partidos**")
     else:
-        st.success(f"{len(partidos)} partidos encontrados en {liga_nombre}")
+        st.success(f"{len(partidos)} partidos encontrados en **{liga_nombre}**")
+
         for m in partidos:
             m['league_code'] = LIGAS[liga_nombre]
 
@@ -142,99 +164,165 @@ with tab1:
             "Elige partidos para analizar",
             list(opciones.keys())[:30],
             max_selections=max_analizar,
+            placeholder="Selecciona hasta {} partidos".format(max_analizar),
         )
 
         if st.button("🔍 Analizar seleccionados", type="primary"):
             if not seleccionados:
                 st.warning("Selecciona al menos un partido.")
             else:
-                st.session_state.analisis = []
-                progreso = st.progress(0, text="Analizando...")
-                for i, sel in enumerate(seleccionados):
-                    idx = opciones[sel]
+                st.session_state.pendientes = [opciones[s] for s in seleccionados]
+
+        # --- Procesar análisis pendiente ---
+        pendientes = st.session_state.pendientes
+        if pendientes:
+            with st.status(f"Analizando {len(pendientes)} partido(s)...",
+                           expanded=True) as status:
+                resultados = []
+                for idx in pendientes:
+                    if idx >= len(partidos):
+                        continue
                     match = partidos[idx]
-                    progreso.progress(
-                        (i + 1) / len(seleccionados),
-                        text=f"Analizando: {match['homeTeam']['name']} vs {match['awayTeam']['name']}"
-                    )
+                    st.write(f"🔍 {match['homeTeam']['name']} vs "
+                             f"{match['awayTeam']['name']}")
                     res = analizar_partido(match, usar_ia=usar_ia)
                     if res:
-                        st.session_state.analisis.append(res)
-                progreso.empty()
-                st.success(f"✅ {len(st.session_state.analisis)} partidos analizados")
+                        resultados.append(res)
+                        st.write(f"   ✅ {len(res['picks'])} picks generados")
 
-        # Mostrar análisis
-        for analisis in st.session_state.analisis:
-            with st.container(border=True):
-                col_t, col_f = st.columns([3, 1])
-                with col_t:
-                    st.subheader(analisis["partido"])
-                with col_f:
-                    st.caption(f"🕐 {analisis['fecha']}")
+                status.update(
+                    label=f"✅ {len(resultados)} partido(s) analizados",
+                    state="complete",
+                )
 
-                c1, c2 = st.columns(2)
+            st.session_state.analisis = resultados
+            st.session_state.pendientes = []
+            st.rerun()
 
-                with c1:
-                    st.markdown("#### 📈 Picks del modelo")
-                    for p in analisis["picks"]:
-                        with st.container(border=True):
-                            st.write(f"**{p['market']}**")
-                            st.write(p["selection"])
-                            cc1, cc2 = st.columns(2)
-                            cc1.metric("Prob", f"{p['prob']}%")
-                            cc2.metric("Cuota justa", f"{p['fair_odd']:.2f}")
+        # --- Mostrar análisis ---
+        if not st.session_state.pendientes and st.session_state.analisis:
+            for analisis in st.session_state.analisis:
+                with st.container(border=True):
+                    col_t, col_f = st.columns([3, 1])
+                    with col_t:
+                        st.subheader(analisis["partido"])
+                    with col_f:
+                        st.caption(f"🕐 {analisis['fecha']}")
 
-                            if st.button("➕ Añadir al boleto",
-                                         key=f"add_{analisis['partido']}_{p['selection']}"):
-                                st.session_state.boleto.append({
-                                    "partido": analisis["partido"],
-                                    "seleccion": p["selection"],
-                                    "cuota": p["fair_odd"],
-                                })
-                                st.toast(f"Añadido: {p['selection']}")
+                    c1, c2 = st.columns(2)
 
-                with c2:
-                    st.markdown("#### 🧠 Análisis IA")
-                    ia = analisis.get("ia")
-                    if not ia:
-                        st.caption("Sin análisis IA")
-                    else:
-                        st.info(ia.get("analisis", ""))
-                        st.write(f"**Pick IA:** {ia.get('pick_recomendado', '-')}")
-                        conf = ia.get("confianza", 0)
-                        st.progress(min(conf, 10) / 10, text=f"Confianza: {conf}/10")
-                        if ia.get("riesgos"):
-                            st.warning("⚠️ " + " · ".join(ia["riesgos"]))
+                    with c1:
+                        st.markdown("#### 📈 Picks del modelo")
+                        if not analisis["picks"]:
+                            st.caption("Ningún pick supera los filtros")
+                        for j, p in enumerate(analisis["picks"]):
+                            with st.container(border=True):
+                                st.write(f"**{p['market']}**")
+                                st.write(p["selection"])
+                                cc1, cc2 = st.columns(2)
+                                cc1.metric("Prob", f"{p['prob']}%")
+                                cc2.metric("Cuota", f"{p['fair_odd']:.2f}")
 
-                # SofaScore
-                sofa = analisis.get("sofascore") or {}
-                if sofa.get("home_stats") or sofa.get("away_stats"):
-                    st.markdown("#### 📊 SofaScore (últimos 10 partidos)")
-                    sc1, sc2 = st.columns(2)
-                    for col, key, label in [(sc1, "home_stats", "Local"),
-                                             (sc2, "away_stats", "Visita")]:
-                        s = sofa.get(key)
-                        if s:
-                            with col:
-                                st.markdown(f"**{s['team_name']}** ({label})")
-                                m1, m2 = st.columns(2)
-                                m1.metric("Goles a favor", s["goles_favor_prom"])
-                                m2.metric("Goles contra", s["goles_contra_prom"])
-                                forma_str = " ".join(
-                                    f"🟢{c}" if c == "W" else f"🔴{c}" if c == "L" else f"⚪{c}"
-                                    for c in s["forma"][-5:]
-                                )
-                                st.write(f"Forma: {forma_str}")
+                                if st.button(
+                                    "➕ Añadir al boleto",
+                                    key=f"add_{analisis['partido']}_{j}",
+                                ):
+                                    st.session_state.boleto.append({
+                                        "partido": analisis["partido"],
+                                        "seleccion": p["selection"],
+                                        "cuota": p["fair_odd"],
+                                    })
+                                    st.toast(f"Añadido: {p['selection']}")
 
+                    with c2:
+                        st.markdown("#### 🧠 Análisis IA")
+                        ia = analisis.get("ia")
+                        if not ia:
+                            st.caption("Sin análisis IA (configura GROQ_API_KEY)")
+                        else:
+                            st.info(ia.get("analisis", ""))
+                            st.write(f"**Pick IA:** {ia.get('pick_recomendado', '-')}")
+                            conf = ia.get("confianza", 0)
+                            st.write(f"Confianza: **{conf}/10**")
+                            if ia.get("riesgos"):
+                                st.warning("⚠️ " + " · ".join(ia["riesgos"]))
+
+                    # SofaScore
+                    sofa = analisis.get("sofascore") or {}
+                    if sofa.get("home_stats") or sofa.get("away_stats"):
+                        st.markdown("#### 📊 SofaScore (últimos 10)")
+                        sc1, sc2 = st.columns(2)
+                        for col, key, label in [
+                            (sc1, "home_stats", "Local"),
+                            (sc2, "away_stats", "Visita"),
+                        ]:
+                            s = sofa.get(key)
+                            if s:
+                                with col:
+                                    st.markdown(f"**{s['team_name']}** ({label})")
+                                    m1, m2 = st.columns(2)
+                                    m1.metric("GF", s["goles_favor_prom"])
+                                    m2.metric("GC", s["goles_contra_prom"])
+                                    forma_str = " ".join(
+                                        "🟢" if c == "W" else
+                                        "🔴" if c == "L" else "⚪"
+                                        for c in s["forma"][-5:]
+                                    )
+                                    st.write(f"Forma: {forma_str}")
+
+
+# ============================================================
+# TAB 2 — RESULTADOS / BOLETO
+# ============================================================
 with tab2:
-    st.subheader("Historial de apuestas")
+    st.subheader("🧾 Boleto actual")
+
     if not st.session_state.boleto:
-        st.info("Boleto vacío.")
+        st.info("Tu boleto está vacío. Añade picks desde la pestaña anterior.")
     else:
         cuota_total = 1.0
         for b in st.session_state.boleto:
             cuota_total *= b["cuota"]
-        st.write(f"**{len(st.session_state.boleto)} selecciones** · "
-                 f"Cuota combinada: **{cuota_total:.2f}**")
-        for b in st.session_state.boleto:
-            st.write(f"• {b['seleccion']} — {b['partido']} @{b['cuota']:.2f}")
+
+        col1, col2 = st.columns(2)
+        col1.metric("Selecciones", len(st.session_state.boleto))
+        col2.metric("Cuota combinada", f"{cuota_total:.2f}")
+
+        st.divider()
+
+        for i, b in enumerate(st.session_state.boleto, 1):
+            with st.container(border=True):
+                st.write(f"**{i}. {b['seleccion']}**")
+                st.caption(f"{b['partido']} · @{b['cuota']:.2f}")
+
+        st.divider()
+
+        stake = st.number_input(
+            "Importe a apostar",
+            min_value=1.0,
+            value=10.0,
+            step=1.0,
+        )
+        ganancia = stake * cuota_total
+        st.success(f"💰 Ganancia potencial: **{ganancia:.2f}**")
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("🗑️ Vaciar boleto", use_container_width=True):
+                st.session_state.boleto = []
+                st.rerun()
+        with col_b:
+            if st.button("📲 Enviar a Telegram", use_container_width=True):
+                msg = "🎯 *LUCI SPORT — BOLETO*\n\n"
+                for i, b in enumerate(st.session_state.boleto, 1):
+                    msg += f"{i}. {b['seleccion']}\n   _{b['partido']}_ · @{b['cuota']:.2f}\n"
+                msg += f"\n📊 Cuota total: *{cuota_total:.2f}*"
+                msg += f"\n💰 Stake: {stake:.2f} → Ganancia: {ganancia:.2f}"
+                try:
+                    ok = L.enviar_a_telegram(msg)
+                    if ok:
+                        st.success("✅ Enviado a Telegram")
+                    else:
+                        st.warning("⚠️ No se pudo enviar (revisa secrets)")
+                except Exception as e:
+                    st.error(f"Error: {e}")
