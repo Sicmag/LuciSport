@@ -1,8 +1,12 @@
 """LuciSport AI — Supabase edition."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
-from st_supabase_connection import SupabaseConnection, execute_query
+from st_supabase_connection import SupabaseConnection
 
+
+# ============================================================
+#  CONFIGURACIÓN
+# ============================================================
 def _get(key, default=""):
     try:
         if key in st.secrets:
@@ -17,6 +21,7 @@ def _get(key, default=""):
         pass
     return os.getenv(key, default)
 
+
 FOOTBALL_KEY = _get("FOOTBALL_API_KEY")
 TELEGRAM_TOKEN = _get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = _get("TELEGRAM_CHAT_ID")
@@ -27,8 +32,6 @@ HEADERS = {'X-Auth-Token': FOOTBALL_KEY}
 PROB_MIN, CUOTA_MIN = 55.0, 1.50
 MAX_PICKS, BANKROLL = 3, 100000
 LINEAS = [0.5, 1.5, 2.5, 3.5, 4.5]
-
-DB_PATH = "lucisport.db"
 
 SPORT_KEYS = {"PL": "soccer_epl", "PD": "soccer_spain_la_liga",
               "SA": "soccer_italy_serie_a", "BL1": "soccer_germany_bundesliga",
@@ -41,167 +44,107 @@ LIGAS = {"Premier League": "PL", "La Liga": "PD", "Serie A": "SA",
 
 
 # ============================================================
-#  BASE DE DATOS
+#  SUPABASE
 # ============================================================
-def init_db():
-    con = sqlite3.connect(DB_PATH)
-    con.executescript("""
-    CREATE TABLE IF NOT EXISTS picks (
-        id           INTEGER PRIMARY KEY AUTOINCREMENT,
-        match_id     TEXT NOT NULL,
-        fecha_partido TEXT,
-        liga         TEXT,
-        home         TEXT,
-        away         TEXT,
-        mercado      TEXT,
-        seleccion    TEXT,
-        prob_modelo  REAL,
-        cuota_justa  REAL,
-        cuota_real   REAL,
-        edge_pct     REAL,
-        stake_sug    REAL,
-        estado       TEXT DEFAULT 'PENDIENTE',
-        resultado_ft TEXT,
-        creado       TEXT,
-        resuelto     TEXT,
-        UNIQUE(match_id, mercado, seleccion)
-    );
-    CREATE INDEX IF NOT EXISTS idx_estado ON picks(estado);
-    CREATE INDEX IF NOT EXISTS idx_creado ON picks(creado);
-    CREATE INDEX IF NOT EXISTS idx_liga   ON picks(liga);
-    """)
-    con.commit()
-    con.close()
+@st.cache_resource(ttl=600, show_spinner=False)
+def get_supabase():
+    return st.connection("supabase", type=SupabaseConnection)
 
 
 def guardar_pick(match, pick, estado="PENDIENTE"):
-    """Guarda o actualiza un pick en la BD."""
-    match_id = f"{match['homeTeam']['id']}_{match['awayTeam']['id']}_{match.get('utcDate','')[:16]}"
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
+    match_id = f"{match['homeTeam']['id']}_{match['awayTeam']['id']}_{(match.get('utcDate') or '')[:16]}"
+    fila = {
+        "match_id": match_id,
+        "fecha_partido": (match.get('utcDate') or '')[:16],
+        "liga": match.get('league_code', ''),
+        "home": match['homeTeam']['name'],
+        "away": match['awayTeam']['name'],
+        "mercado": pick['market'],
+        "seleccion": pick['selection'],
+        "prob_modelo": pick['prob'],
+        "cuota_justa": pick['fair_odd'],
+        "cuota_real": pick.get('cuota_real'),
+        "edge_pct": pick.get('edge_%'),
+        "stake_sug": pick.get('stake_sug'),
+        "estado": estado,
+    }
     try:
-        cur.execute("""
-            INSERT INTO picks
-              (match_id, fecha_partido, liga, home, away, mercado, seleccion,
-               prob_modelo, cuota_justa, cuota_real, edge_pct, stake_sug,
-               estado, creado)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(match_id, mercado, seleccion) DO UPDATE SET
-              prob_modelo=excluded.prob_modelo,
-              cuota_justa=excluded.cuota_justa,
-              cuota_real=excluded.cuota_real,
-              edge_pct=excluded.edge_pct,
-              stake_sug=excluded.stake_sug
-        """, (
-            match_id,
-            (match.get('utcDate') or '')[:16],
-            match.get('league_code', ''),
-            match['homeTeam']['name'],
-            match['awayTeam']['name'],
-            pick['market'],
-            pick['selection'],
-            pick['prob'],
-            pick['fair_odd'],
-            pick.get('cuota_real'),
-            pick.get('edge_%'),
-            pick.get('stake_sug'),
-            estado,
-            datetime.now(timezone.utc).isoformat(),
-        ))
-        con.commit()
+        get_supabase().table("picks").upsert(fila).execute()
     except Exception as e:
         st.warning(f"Error guardando pick: {e}")
-    finally:
-        con.close()
 
 
 def listar_picks(estado=None, limite=200):
-    """Devuelve picks filtrados por estado."""
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    if estado:
-        cur.execute("""SELECT id, fecha_partido, liga, home, away, mercado,
-                              seleccion, prob_modelo, cuota_justa, cuota_real,
-                              edge_pct, estado, creado
-                       FROM picks WHERE estado=?
-                       ORDER BY creado DESC LIMIT ?""", (estado, limite))
-    else:
-        cur.execute("""SELECT id, fecha_partido, liga, home, away, mercado,
-                              seleccion, prob_modelo, cuota_justa, cuota_real,
-                              edge_pct, estado, creado
-                       FROM picks ORDER BY creado DESC LIMIT ?""", (limite,))
-    rows = cur.fetchall()
-    con.close()
-    return rows
+    try:
+        q = get_supabase().table("picks").select("*").order("creado", desc=True).limit(limite)
+        if estado:
+            q = q.eq("estado", estado)
+        return q.execute().data or []
+    except Exception as e:
+        st.warning(f"Error leyendo picks: {e}")
+        return []
 
 
 def stats_por_estado():
-    """Cuenta picks por estado."""
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT estado, COUNT(*) FROM picks GROUP BY estado")
-    res = dict(cur.fetchall())
-    con.close()
-    return res
+    try:
+        rows = get_supabase().table("picks").select("estado").execute().data or []
+        res = {}
+        for r in rows:
+            res[r["estado"]] = res.get(r["estado"], 0) + 1
+        return res
+    except Exception:
+        return {}
 
 
 def cambiar_estado(pick_id, nuevo_estado):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""UPDATE picks SET estado=?, resuelto=?
-                   WHERE id=?""",
-                (nuevo_estado, datetime.now(timezone.utc).isoformat(), pick_id))
-    con.commit()
-    con.close()
+    try:
+        get_supabase().table("picks").update({
+            "estado": nuevo_estado,
+            "resuelto": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", pick_id).execute()
+    except Exception as e:
+        st.warning(f"Error actualizando: {e}")
 
 
 def eliminar_pick(pick_id):
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("DELETE FROM picks WHERE id=?", (pick_id,))
-    con.commit()
-    con.close()
+    try:
+        get_supabase().table("picks").delete().eq("id", pick_id).execute()
+    except Exception as e:
+        st.warning(f"Error eliminando: {e}")
 
 
 def stats_rendimiento():
-    """Devuelve el rendimiento por mercado y global."""
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("""SELECT estado, COUNT(*) FROM picks
-                   WHERE estado IN ('GANADO','PERDIDO','ANULADO')
-                   GROUP BY estado""")
-    res = dict(cur.fetchall())
-    ganados = res.get('GANADO', 0)
-    perdidos = res.get('PERDIDO', 0)
-    anulados = res.get('ANULADO', 0)
-    total_resueltos = ganados + perdidos
-    hit_rate = round(ganados / total_resueltos * 100, 1) if total_resueltos else 0
+    rows = listar_picks(limite=2000)
+    ganados = sum(1 for r in rows if r["estado"] == "GANADO")
+    perdidos = sum(1 for r in rows if r["estado"] == "PERDIDO")
+    anulados = sum(1 for r in rows if r["estado"] == "ANULADO")
+    tot = ganados + perdidos
+    hit = round(ganados / tot * 100, 1) if tot else 0
 
-    # Por mercado
-    cur.execute("""SELECT mercado,
-                     SUM(CASE WHEN estado='GANADO' THEN 1 ELSE 0 END),
-                     SUM(CASE WHEN estado='PERDIDO' THEN 1 ELSE 0 END),
-                     SUM(CASE WHEN estado='ANULADO' THEN 1 ELSE 0 END)
-                   FROM picks
-                   WHERE estado IN ('GANADO','PERDIDO','ANULADO')
-                   GROUP BY mercado""")
-    mercados = []
-    for m, g, p, a in cur.fetchall():
-        tot = (g or 0) + (p or 0)
-        mercados.append({
-            "mercado": m, "ganados": g or 0, "perdidos": p or 0,
-            "anulados": a or 0,
-            "hit": round((g or 0) / tot * 100, 1) if tot else 0,
+    mercados = {}
+    for r in rows:
+        if r["estado"] not in ("GANADO", "PERDIDO", "ANULADO"):
+            continue
+        m = r["mercado"]
+        mercados.setdefault(m, {"ganados": 0, "perdidos": 0, "anulados": 0})
+        if r["estado"] == "GANADO": mercados[m]["ganados"] += 1
+        elif r["estado"] == "PERDIDO": mercados[m]["perdidos"] += 1
+        else: mercados[m]["anulados"] += 1
+
+    por_mercado = []
+    for m, d in mercados.items():
+        tot_m = d["ganados"] + d["perdidos"]
+        por_mercado.append({
+            "mercado": m,
+            "ganados": d["ganados"], "perdidos": d["perdidos"],
+            "anulados": d["anulados"],
+            "hit": round(d["ganados"] / tot_m * 100, 1) if tot_m else 0,
         })
 
-    con.close()
     return {
         "ganados": ganados, "perdidos": perdidos, "anulados": anulados,
-        "hit_rate": hit_rate, "por_mercado": mercados,
+        "hit_rate": hit, "por_mercado": por_mercado,
     }
-
-
-init_db()
 
 
 # ============================================================
@@ -212,8 +155,10 @@ def poisson(lam, k):
         return 1.0 if k == 0 else 0.0
     return (lam**k * math.exp(-lam)) / math.factorial(k)
 
+
 def poisson_cdf(lam, x_max):
     return sum(poisson(lam, k) for k in range(0, x_max + 1))
+
 
 def dc_tau(i, j, lh, la, rho=-0.10):
     if i == 0 and j == 0: return 1 - lh * la * rho
@@ -222,16 +167,19 @@ def dc_tau(i, j, lh, la, rho=-0.10):
     if i == 1 and j == 1: return 1 - rho
     return 1.0
 
+
 def score_matrix(lh, la, mg=8):
     m = [[poisson(lh, i) * poisson(la, j) * dc_tau(i, j, lh, la)
           for j in range(mg + 1)] for i in range(mg + 1)]
     s = sum(sum(r) for r in m)
     return [[v / s for v in row] for row in m]
 
+
 def over_under(lam, linea):
     x = int(math.floor(linea))
     p_under = poisson_cdf(lam, x) * 100
     return round(100 - p_under), round(p_under)
+
 
 def kelly(prob, odd, bank=BANKROLL):
     p, b = prob / 100.0, odd - 1
@@ -239,6 +187,7 @@ def kelly(prob, odd, bank=BANKROLL):
     f = (p * b - (1 - p)) / b
     if f <= 0: return 0.0
     return round(bank * min(f * 0.25, 0.05), 2)
+
 
 _LAST = [0.0]
 def _rl(t=1.5):
@@ -248,7 +197,7 @@ def _rl(t=1.5):
 
 
 # ============================================================
-#  DATOS DE API
+#  DATOS API
 # ============================================================
 @st.cache_data(ttl=43200, show_spinner=False)
 def get_team_data(tid):
@@ -294,11 +243,13 @@ def fetch_odds(sport_key):
     except Exception:
         return []
 
+
 def _norm(s):
     n = (s or "").lower().strip()
     for suf in [' cf', ' fc', ' sc', ' ac', ' club', ' ud', ' cd', ' real', ' atletico']:
         n = n.replace(suf, '')
     return n.strip()
+
 
 def get_odds(match):
     sk = SPORT_KEYS.get(match.get("league_code", ""))
@@ -320,8 +271,7 @@ def get_odds(match):
         for mk in bk.get("markets", []):
             if mk.get("key") == "h2h":
                 for o in mk.get("outcomes", []):
-                    p = o.get("price")
-                    nm = o.get("name", "")
+                    p = o.get("price"); nm = o.get("name", "")
                     if not p: continue
                     if nm == "Draw": ch["d"].append(float(p))
                     elif nm == ha: ch["h"].append(float(p))
@@ -329,12 +279,10 @@ def get_odds(match):
             elif mk.get("key") == "totals":
                 for o in mk.get("outcomes", []):
                     pt = str(o.get("point", "")).strip()
-                    nm = o.get("name", "")
-                    p = o.get("price")
+                    nm = o.get("name", ""); p = o.get("price")
                     if not p or not pt: continue
                     ou.setdefault(pt, {"Over": [], "Under": []})
-                    if nm in ("Over", "Under"):
-                        ou[pt][nm].append(float(p))
+                    if nm in ("Over", "Under"): ou[pt][nm].append(float(p))
     avg = lambda l: round(sum(l) / len(l), 2) if l else 0
     out = {"1X2": {}, "Goles totales": {}}
     if ch["h"]: out["1X2"]["Gana " + h] = avg(ch["h"])
@@ -347,7 +295,7 @@ def get_odds(match):
 
 
 # ============================================================
-#  ANÁLISIS
+#  MOTOR DE ANÁLISIS
 # ============================================================
 def analizar(match):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
@@ -398,6 +346,8 @@ def analizar(match):
         if p["market"] not in pm or p["prob"] > pm[p["market"]]["prob"]:
             pm[p["market"]] = p
     top = sorted(pm.values(), key=lambda x: x["prob"], reverse=True)[:MAX_PICKS]
+    for p in top:
+        p["stake_sug"] = kelly(p["prob"], p["fair_odd"])
     return top
 
 
@@ -481,7 +431,6 @@ with st.sidebar:
         st.rerun()
     st.divider()
 
-    # Stats rápidas
     s = stats_por_estado()
     st.caption(
         f"📊 BD: {s.get('PENDIENTE', 0)} pend · "
@@ -512,15 +461,14 @@ with st.sidebar:
             st.rerun()
 
 
-# ---------- CUERPO ----------
 st.title("⚽ LuciSport AI")
-st.caption("Dixon-Coles + Groq + Odds API + Base de datos")
+st.caption("Dixon-Coles + Groq + Odds API + Supabase")
 
 t1, t2, t3 = st.tabs(["📅 Partidos", "🧾 Boleto", "📚 Historial"])
 
 
 # ============================================================
-#  TAB 1: PARTIDOS
+#  TAB 1
 # ============================================================
 with t1:
     if not st.session_state.partidos:
@@ -544,7 +492,6 @@ with t1:
                     with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
                         try:
                             picks = analizar(m)
-                            # Guardar cada pick en BD
                             for p in picks:
                                 guardar_pick(m, p)
                             ia = ia_analizar(m, picks) if usar_ia else None
@@ -566,7 +513,7 @@ with t1:
                                 "traceback": traceback.format_exc(),
                             })
                 st.session_state.analisis = res
-                st.success(f"✅ {len(res)} partidos analizados y guardados en BD")
+                st.success(f"✅ {len(res)} partidos analizados y guardados")
                 st.rerun()
 
         for a in st.session_state.analisis:
@@ -621,7 +568,7 @@ with t1:
 
 
 # ============================================================
-#  TAB 2: BOLETO
+#  TAB 2
 # ============================================================
 with t2:
     st.subheader("🧾 Boleto")
@@ -647,12 +594,10 @@ with t2:
 
 
 # ============================================================
-#  TAB 3: HISTORIAL
+#  TAB 3
 # ============================================================
 with t3:
-    st.subheader("📚 Historial de picks")
-
-    # ----- Resumen general -----
+    st.subheader("📚 Historial")
     rend = stats_rendimiento()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("✅ Ganados", rend["ganados"])
@@ -670,14 +615,9 @@ with t3:
                 )
 
     st.divider()
-
-    # ----- Filtros -----
-    filtro = st.radio(
-        "Filtrar por estado:",
-        ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
-        horizontal=True,
-    )
-
+    filtro = st.radio("Filtrar:",
+                      ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
+                      horizontal=True)
     estado = None if filtro == "Todos" else filtro
     picks = listar_picks(estado=estado)
 
@@ -685,54 +625,40 @@ with t3:
         st.info(f"No hay picks con estado **{filtro}**")
     else:
         st.caption(f"Mostrando {len(picks)} picks")
-
-        # Tabla con acciones por pick
-        for row in picks:
-            (pid, fecha, lg, home, away, mercado, seleccion,
-             prob, cuota_justa, cuota_real, edge, estado_actual, creado) = row
-
+        for p in picks:
+            pid = p["id"]
             with st.container(border=True):
                 col_info, col_acc = st.columns([3, 2])
-
                 with col_info:
-                    st.write(f"**{home} vs {away}**")
-                    st.caption(f"🕐 {fecha} · {lg}")
-                    st.write(f"🎯 {mercado}: **{seleccion}**")
+                    st.write(f"**{p['home']} vs {p['away']}**")
+                    st.caption(f"🕐 {p['fecha_partido']} · {p.get('liga','')}")
+                    st.write(f"🎯 {p['mercado']}: **{p['seleccion']}**")
                     c1, c2, c3 = st.columns(3)
-                    c1.metric("Prob", f"{prob:.0f}%")
-                    c2.metric("C. justa", f"{cuota_justa:.2f}")
-                    c3.metric("C. real", f"{cuota_real:.2f}" if cuota_real else "—")
+                    c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
+                    c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
+                    c3.metric("C. real", f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
 
-                    # Color del estado
-                    if estado_actual == "GANADO":
-                        st.success("✅ GANADO")
-                    elif estado_actual == "PERDIDO":
-                        st.error("❌ PERDIDO")
-                    elif estado_actual == "ANULADO":
-                        st.info("⭕ ANULADO")
-                    else:
-                        st.warning("⏳ PENDIENTE")
+                    est = p["estado"]
+                    if est == "GANADO": st.success("✅ GANADO")
+                    elif est == "PERDIDO": st.error("❌ PERDIDO")
+                    elif est == "ANULADO": st.info("⭕ ANULADO")
+                    else: st.warning("⏳ PENDIENTE")
 
                 with col_acc:
                     st.write("**Cambiar estado:**")
                     b1, b2, b3 = st.columns(3)
                     with b1:
-                        if st.button("✅", key=f"g_{pid}", help="Marcar GANADO",
-                                     use_container_width=True):
+                        if st.button("✅", key=f"g_{pid}", use_container_width=True):
                             cambiar_estado(pid, "GANADO")
                             st.rerun()
                     with b2:
-                        if st.button("❌", key=f"p_{pid}", help="Marcar PERDIDO",
-                                     use_container_width=True):
+                        if st.button("❌", key=f"p_{pid}", use_container_width=True):
                             cambiar_estado(pid, "PERDIDO")
                             st.rerun()
                     with b3:
-                        if st.button("⭕", key=f"a_{pid}", help="Marcar ANULADO",
-                                     use_container_width=True):
+                        if st.button("⭕", key=f"a_{pid}", use_container_width=True):
                             cambiar_estado(pid, "ANULADO")
                             st.rerun()
-
-                    if st.button("🗑️ Eliminar", key=f"d_{pid}",
-                                 use_container_width=True):
+                    if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
                         eliminar_pick(pid)
                         st.rerun()
