@@ -1,7 +1,8 @@
-"""LuciSport AI — Supabase + 5DollarFootballAPI."""
+"""LuciSport AI — versión unificada con mercados, combinadas y auto-refresh."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
+from streamlit_autorefresh import st_autorefresh
 
 
 # ============================================================
@@ -27,37 +28,12 @@ TELEGRAM_TOKEN = _get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = _get("TELEGRAM_CHAT_ID")
 ODDS_KEYS = [k.strip() for k in _get("ODDS_API_KEYS", "").split(",") if k.strip()]
 GROQ_KEY = _get("GROQ_API_KEY", "")
-DOLLAR_KEY = _get("DOLLAR_API_KEY", "")
 
 HEADERS = {'X-Auth-Token': FOOTBALL_KEY}
 
-# ---------- 5DOLLARFOOTBALL (config real) ----------
-DOLLAR_BASE = "https://api.5dollarfootballapi.com/v1"
-DOLLAR_LEAGUES = {
-    "PL":  "4160026622",   # Premier League
-    "PD":  "421821298",    # La Liga
-    "SA":  "3405541143",   # Serie A
-    "BL1": "68637048",     # Bundesliga
-    "FL1": "3614399544",   # Ligue 1
-}
-
-# Promedios de liga para córners/tarjetas (estimaciones iniciales)
-# Se usarán si no hay datos específicos del equipo
-PROM_CORNERS_LIGA = {
-    "PL": 10.5, "PD": 9.5, "SA": 10.0, "BL1": 10.5, "FL1": 9.8,
-    "CL": 10.5, "ELI": 10.0, "CLI": 9.8,
-}
-PROM_CARDS_LIGA = {
-    "PL": 4.2, "PD": 5.5, "SA": 4.8, "BL1": 4.0, "FL1": 4.5,
-    "CL": 4.5, "ELI": 4.5, "CLI": 5.5,
-}
-
-# ---------- PARÁMETROS DEL MODELO ----------
 PROB_MIN, CUOTA_MIN = 55.0, 1.50
 MAX_PICKS, BANKROLL = 5, 100000
 LINEAS = [0.5, 1.5, 2.5, 3.5, 4.5]
-LINEAS_CORNERS = [7.5, 8.5, 9.5, 10.5, 11.5]
-LINEAS_TARJETAS = [2.5, 3.5, 4.5, 5.5]
 
 SPORT_KEYS = {"PL": "soccer_epl", "PD": "soccer_spain_la_liga",
               "SA": "soccer_italy_serie_a", "BL1": "soccer_germany_bundesliga",
@@ -168,9 +144,12 @@ def stats_rendimiento():
             continue
         m = r["mercado"]
         mercados.setdefault(m, {"ganados": 0, "perdidos": 0, "anulados": 0})
-        if r["estado"] == "GANADO": mercados[m]["ganados"] += 1
-        elif r["estado"] == "PERDIDO": mercados[m]["perdidos"] += 1
-        else: mercados[m]["anulados"] += 1
+        if r["estado"] == "GANADO":
+            mercados[m]["ganados"] += 1
+        elif r["estado"] == "PERDIDO":
+            mercados[m]["perdidos"] += 1
+        else:
+            mercados[m]["anulados"] += 1
 
     por_mercado = []
     for m, d in mercados.items():
@@ -238,86 +217,7 @@ def _rl(t=1.5):
 
 
 # ============================================================
-#  5DOLLARFOOTBALL
-# ============================================================
-def _ts_to_iso(ts):
-    """Convierte unix seconds a string legible."""
-    try:
-        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M")
-    except Exception:
-        return ""
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def dollar_get_fixtures(liga_id, dias_offset=0):
-    """
-    Trae partidos de 5DollarFootball para 24h a partir de hoy+dias_offset.
-    Devuelve lista de dicts listos para usar.
-    """
-    if not DOLLAR_KEY or not liga_id:
-        return []
-    # Unix seconds: inicio del día UTC + offset
-    ahora = datetime.now(timezone.utc)
-    inicio = (ahora + timedelta(days=dias_offset)).replace(
-        hour=0, minute=0, second=0, microsecond=0)
-    fin = inicio + timedelta(hours=24)
-    start_ts = int(inicio.timestamp())
-    end_ts = int(fin.timestamp())
-
-    try:
-        r = requests.get(f"{DOLLAR_BASE}/fixtures",
-                         params={"api_key": DOLLAR_KEY,
-                                 "start_time": start_ts,
-                                 "end_time": end_ts,
-                                 "league": liga_id,
-                                 "per_page": 50},
-                         timeout=15)
-        data = r.json() if r.status_code == 200 else {}
-    except Exception:
-        return []
-
-    if not data.get("success"):
-        return []
-
-    out = []
-    for f in data.get("data", []):
-        home = (f.get("teams") or {}).get("home") or {}
-        away = (f.get("teams") or {}).get("away") or {}
-        lg = (f.get("league") or {}).get("name", "")
-        kickoff = _ts_to_iso(f.get("kickoff_ts", 0))
-        out.append({
-            "id_dollar": f.get("id"),
-            "home": home.get("name", "?"),
-            "away": away.get("name", "?"),
-            "home_id_dollar": home.get("id"),
-            "away_id_dollar": away.get("id"),
-            "liga_nombre": lg,
-            "kickoff": kickoff,
-            "status": f.get("status", "scheduled"),
-            "goals_home": (f.get("goals") or {}).get("home", 0),
-            "goals_away": (f.get("goals") or {}).get("away", 0),
-            "corners_home": (f.get("corners") or {}).get("home", 0),
-            "corners_away": (f.get("corners") or {}).get("away", 0),
-            "cards_home": ((f.get("cards") or {}).get("yellow") or {}).get("home", 0),
-            "cards_away": ((f.get("cards") or {}).get("yellow") or {}).get("away", 0),
-        })
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def dollar_get_team_form(team_name, liga_codigo, dias_atras=30):
-    """
-    Estima forma del equipo usando los datos de 5Dollar.
-    Solo funciona con partidos FUTUROS con status='finished'.
-    Como 5Dollar no da histórico, usa promedios de liga si no hay datos.
-    """
-    # Devuelve None para que el modelo use los promedios de liga
-    # Cuando la app acumule histórico real en Supabase, se puede mejorar
-    return None
-
-
-# ============================================================
-#  FOOTBALL-DATA.ORG
+#  DATOS API
 # ============================================================
 @st.cache_data(ttl=43200, show_spinner=False)
 def get_team_data(tid):
@@ -364,9 +264,6 @@ def cargar_partidos(cod, dias=5):
         return []
 
 
-# ============================================================
-#  THE ODDS API
-# ============================================================
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_odds(sport_key):
     if not ODDS_KEYS: return []
@@ -431,14 +328,15 @@ def get_odds_oddsapi(match):
 
 
 # ============================================================
-#  MOTOR DE ANÁLISIS (con córners y tarjetas)
+#  MOTOR DE ANÁLISIS
 # ============================================================
-def analizar(match, liga_codigo):
+def analizar(match, liga_codigo, edge_min=0.0, prob_min=None, solo_con_cuota_real=False):
+    if prob_min is None:
+        prob_min = PROB_MIN
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     hs = get_team_data(match['homeTeam']['id'])
     as_ = get_team_data(match['awayTeam']['id'])
 
-    # ---------- Goles ----------
     exH = ((hs['gf'] + as_['gc']) / 2) * 1.10
     exA = ((as_['gf'] + hs['gc']) / 2) * 0.95
     tot = exH + exA
@@ -459,13 +357,11 @@ def analizar(match, liga_codigo):
         fo = round(1 / (pr / 100.0), 2) if pr > 0 else 0
         picks.append({"market": mk, "selection": sel, "prob": pr, "fair_odd": fo})
 
-    # 1X2
     add("1X2", f"Gana {h}", pL)
     add("1X2", f"Gana {a}", pV)
     add("1X2", f"1X {h}", pL + pE)
     add("1X2", f"X2 {a}", pV + pE)
 
-    # Goles
     for mk, lam in [("Goles totales", tot), (f"Goles {h}", exH),
                     (f"Goles {a}", exA), ("Goles 1T", exH1 + exA1),
                     ("Goles 2T", exH2 + exA2)]:
@@ -474,35 +370,10 @@ def analizar(match, liga_codigo):
             add(mk, f"+{ln}", po)
             add(mk, f"-{ln}", pu)
 
-    # BTTS
     btts = round(((1 - poisson(exH, 0)) * (1 - poisson(exA, 0))) * 100, 1)
     add("BTTS", "Ambos marcan", btts)
 
-    # ---------- CÓRNERS (promedio de liga) ----------
-    prom_corners = PROM_CORNERS_LIGA.get(liga_codigo, 10.0)
-    lam_corners = prom_corners
-    for ln in LINEAS_CORNERS:
-        po, pu = over_under(lam_corners, ln)
-        add("Córners totales", f"+{ln}", po)
-        add("Córners totales", f"-{ln}", pu)
-
-    # Córners por equipo (mitad del promedio + home advantage)
-    lam_corners_home = prom_corners / 2 * 1.15
-    lam_corners_away = prom_corners / 2 * 0.85
-    for ln in [3.5, 4.5, 5.5, 6.5]:
-        po, _ = over_under(lam_corners_home, ln)
-        add(f"Córners {h}", f"+{ln}", po)
-        po, _ = over_under(lam_corners_away, ln)
-        add(f"Córners {a}", f"+{ln}", po)
-
-    # ---------- TARJETAS (promedio de liga) ----------
-    prom_cards = PROM_CARDS_LIGA.get(liga_codigo, 4.5)
-    for ln in LINEAS_TARJETAS:
-        po, pu = over_under(prom_cards, ln)
-        add("Tarjetas totales", f"+{ln}", po)
-        add("Tarjetas totales", f"-{ln}", pu)
-
-    # ---------- CUOTAS REALES (Odds API) ----------
+    # Cuotas reales
     try:
         cuotas_oddsapi = get_odds_oddsapi(match)
         for p in picks:
@@ -513,33 +384,31 @@ def analizar(match, liga_codigo):
     except Exception:
         pass
 
-    # ---------- FILTRAR + TOP ----------
-    validos = [p for p in picks if p["prob"] >= PROB_MIN and p["fair_odd"] >= CUOTA_MIN]
+    # Filtros
+    validos = []
+    for p in picks:
+        if p["prob"] < prob_min:
+            continue
+        if p["fair_odd"] < CUOTA_MIN:
+            continue
+        if solo_con_cuota_real and not p.get("cuota_real"):
+            continue
+        if p.get("edge_%") is not None and p["edge_%"] < edge_min:
+            continue
+        validos.append(p)
+
     pm = {}
     for p in validos:
         key = f"{p['market']}|{p['selection']}"
         if key not in pm or p["prob"] > pm[key]["prob"]:
             pm[key] = p
+
     top = sorted(pm.values(),
-                 key=lambda x: (x.get("edge_%") or 0, x["prob"]),
+                 key=lambda x: (x.get("edge_%") or -999, x["prob"]),
                  reverse=True)[:MAX_PICKS]
     for p in top:
         p["stake_sug"] = kelly(p["prob"], p["fair_odd"])
     return top
-
-
-def convertir_dollar_a_football(d_fix, liga_codigo):
-    """Adapta un fixture de 5Dollar al formato de football-data.org."""
-    return {
-        "homeTeam": {"id": d_fix.get("home_id_dollar") or hash(d_fix["home"]) % 1000000,
-                     "name": d_fix["home"]},
-        "awayTeam": {"id": d_fix.get("away_id_dollar") or hash(d_fix["away"]) % 1000000,
-                     "name": d_fix["away"]},
-        "utcDate": d_fix.get("kickoff", ""),
-        "status": d_fix.get("status", "SCHEDULED").upper(),
-        "league_code": liga_codigo,
-        "_dollar_id": d_fix.get("id_dollar"),
-    }
 
 
 def ia_analizar(match, picks):
@@ -591,18 +460,13 @@ if "analisis" not in st.session_state:
     st.session_state.analisis = []
 if "boleto" not in st.session_state:
     st.session_state.boleto = []
-if "fuente" not in st.session_state:
-    st.session_state.fuente = "football-data.org"
 
 
-# ---------- SIDEBAR ----------
+# ============================================================
+#  SIDEBAR
+# ============================================================
 with st.sidebar:
     st.title("⚽ LuciSport AI")
-
-    fuente = st.radio("Fuente de partidos:",
-                      ["football-data.org", "5DollarFootballAPI"],
-                      index=0, horizontal=False)
-    st.session_state.fuente = fuente
 
     liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
     liga_codigo = LIGAS[liga_nombre]
@@ -612,22 +476,17 @@ with st.sidebar:
     max_p = st.slider("Máx. partidos", 1, 5, 1)
 
     st.divider()
+    st.subheader("⚙️ Filtros")
+    edge_min = st.slider("Edge mínimo (%)", 0.0, 15.0, 4.0, 0.5,
+                         help="Solo picks con edge >= este valor")
+    prob_min = st.slider("Prob mínima (%)", 50.0, 85.0, 55.0, 1.0)
+    solo_cuota_real = st.checkbox("Solo con cuota real", value=True,
+                                  help="Descarta picks sin cuota de casas")
+
+    st.divider()
     if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
-        with st.spinner(f"Cargando desde {fuente}..."):
-            if fuente == "5DollarFootballAPI":
-                liga_id = DOLLAR_LEAGUES.get(liga_codigo)
-                if not liga_id:
-                    st.error(f"5Dollar no cubre {liga_codigo}")
-                    st.session_state.partidos = []
-                else:
-                    partidos = []
-                    for offset in range(min(dias, 7)):
-                        fixtures = dollar_get_fixtures(liga_id, offset)
-                        for f in fixtures:
-                            partidos.append(convertir_dollar_a_football(f, liga_codigo))
-                    st.session_state.partidos = partidos
-            else:
-                st.session_state.partidos = cargar_partidos(liga_codigo, dias)
+        with st.spinner("Cargando..."):
+            st.session_state.partidos = cargar_partidos(liga_codigo, dias)
             st.session_state.analisis = []
         st.rerun()
 
@@ -640,16 +499,21 @@ with st.sidebar:
     )
 
     with st.expander("🔬 Debug APIs"):
-        st.caption(f"Fuente: **{fuente}**")
         st.caption(f"Supabase: `{_limpiar_url(_get('SUPABASE_URL',''))[:35]}...`")
-        st.caption(f"5Dollar key: {'✅' if DOLLAR_KEY else '❌'}")
         st.caption(f"Odds API: {len(ODDS_KEYS)} keys")
         st.caption(f"Groq: {'✅' if GROQ_KEY else '❌'}")
-        if st.button("🧪 Probar 5Dollar"):
-            d = dollar_get_fixtures(DOLLAR_LEAGUES["PL"], 0)
-            st.write(f"{len(d)} partidos encontrados")
-            if d:
-                st.json(d[:2])
+
+    st.divider()
+    st.subheader("🔄 Actualización")
+    refresh_seg = st.selectbox(
+        "Auto-refresh",
+        [0, 30, 60, 300, 600],
+        format_func=lambda x: "Desactivado" if x == 0 else f"Cada {x}s",
+        index=0,
+    )
+    if refresh_seg > 0:
+        st_autorefresh(interval=refresh_seg * 1000, key="auto_refresh")
+        st.caption("✅ Recarga automática activa")
 
     st.divider()
     st.subheader("🧾 Boleto")
@@ -674,27 +538,40 @@ with st.sidebar:
             st.rerun()
 
 
+# ============================================================
+#  HEADER
+# ============================================================
 st.title("⚽ LuciSport AI")
-st.caption("Dixon-Coles + Groq + Odds API + 5DollarFootball + Supabase")
+st.caption("Dixon-Coles + Groq + Odds API + Supabase")
 
-t1, t2, t3 = st.tabs(["📅 Partidos", "🧾 Boleto", "📚 Historial"])
+t1, t2, t3, t4, t5 = st.tabs([
+    "📅 Partidos",
+    "📊 Por Mercados",
+    "🔗 Combinadas",
+    "🧾 Boleto",
+    "📚 Historial",
+])
 
 
 # ============================================================
-#  TAB 1
+#  TAB 1: PARTIDOS
 # ============================================================
 with t1:
     if not st.session_state.partidos:
-        st.info("👈 Menú » → elige liga y fuente → Cargar partidos")
+        st.info("👈 Menú » → elige liga → Cargar partidos")
     else:
-        st.success(f"{len(st.session_state.partidos)} partidos en "
-                   f"**{liga_nombre}** (fuente: {st.session_state.fuente})")
+        st.success(f"{len(st.session_state.partidos)} partidos en **{liga_nombre}**")
+
+        for m in st.session_state.partidos:
+            m['league_code'] = liga_codigo
 
         ops = {f"{p['homeTeam']['name']} vs {p['awayTeam']['name']} · "
                f"{(p.get('utcDate') or '')[:16]}": i
                for i, p in enumerate(st.session_state.partidos)}
+
         sel = st.multiselect("Elige partidos", list(ops.keys())[:30],
                              max_selections=max_p)
+
         if st.button("🔍 Analizar", type="primary"):
             if not sel:
                 st.warning("Selecciona al menos 1")
@@ -704,7 +581,10 @@ with t1:
                     m = st.session_state.partidos[ops[s]]
                     with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
                         try:
-                            picks = analizar(m, liga_codigo)
+                            picks = analizar(m, liga_codigo,
+                                             edge_min=0.0,
+                                             prob_min=prob_min,
+                                             solo_con_cuota_real=False)
                             for p in picks:
                                 guardar_pick(m, p)
                             ia = ia_analizar(m, picks) if usar_ia else None
@@ -735,6 +615,7 @@ with t1:
                 with st.expander("Traceback"):
                     st.code(a.get("traceback", ""))
                 continue
+
             with st.container(border=True):
                 st.subheader(a["partido"])
                 st.caption(f"🕐 {a['fecha']}")
@@ -781,9 +662,302 @@ with t1:
 
 
 # ============================================================
-#  TAB 2
+#  TAB 2: POR MERCADOS
 # ============================================================
 with t2:
+    st.subheader("📊 Picks por mercado")
+
+    if not st.session_state.analisis:
+        st.info("👈 Analiza partidos primero en la pestaña **📅 Partidos**")
+    else:
+        todos = []
+        for a in st.session_state.analisis:
+            for p in a["picks"]:
+                todos.append({**p, "partido": a["partido"], "fecha": a["fecha"]})
+
+        if not todos:
+            st.warning("No hay picks analizados.")
+        else:
+            por_mercado = {}
+            for p in todos:
+                por_mercado.setdefault(p["market"], []).append(p)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total picks", len(todos))
+            c2.metric("Mercados", len(por_mercado))
+            con_edge = [p for p in todos if p.get("edge_%")]
+            if con_edge:
+                edge_prom = round(sum(p["edge_%"] for p in con_edge) / len(con_edge), 1)
+                c3.metric("Edge promedio", f"{edge_prom}%")
+
+            st.divider()
+
+            filtro_orden = st.radio(
+                "Ordenar por:",
+                ["Edge ↓", "Probabilidad ↓", "Cuota ↓"],
+                horizontal=True,
+            )
+
+            for mercado, picks in sorted(por_mercado.items()):
+                with st.expander(
+                    f"**{mercado}** — {len(picks)} picks",
+                    expanded=(len(por_mercado) <= 3),
+                ):
+                    if filtro_orden == "Edge ↓":
+                        picks.sort(key=lambda x: x.get("edge_%") or -999, reverse=True)
+                    elif filtro_orden == "Probabilidad ↓":
+                        picks.sort(key=lambda x: x["prob"], reverse=True)
+                    else:
+                        picks.sort(key=lambda x: x["fair_odd"], reverse=True)
+
+                    for i, p in enumerate(picks):
+                        with st.container(border=True):
+                            col1, col2, col3 = st.columns([3, 2, 1])
+                            with col1:
+                                st.write(f"**{p['selection']}**")
+                                st.caption(f"{p['partido']} · {p['fecha']}")
+                            with col2:
+                                mc1, mc2, mc3 = st.columns(3)
+                                mc1.metric("Prob", f"{p['prob']}%")
+                                mc2.metric("C. justa", f"{p['fair_odd']:.2f}")
+                                if p.get("cuota_real"):
+                                    edge = p.get("edge_%", 0)
+                                    mc3.metric("C. real", f"{p['cuota_real']:.2f}",
+                                               delta=f"{edge:+.1f}%")
+                                else:
+                                    mc3.metric("C. real", "—")
+                            with col3:
+                                if st.button("➕", key=f"add_merc_{mercado}_{i}",
+                                             help="Añadir al boleto"):
+                                    st.session_state.boleto.append({
+                                        "partido": p["partido"],
+                                        "seleccion": p["selection"],
+                                        "cuota": p.get("cuota_real") or p["fair_odd"],
+                                    })
+                                    st.toast(f"Añadido: {p['selection']}")
+
+
+# ============================================================
+#  TAB 3: COMBINADAS
+# ============================================================
+with t3:
+    st.subheader("🔗 Crear combinada")
+
+    todos_picks = []
+    for a in st.session_state.analisis:
+        for p in a["picks"]:
+            todos_picks.append({**p, "partido": a["partido"], "fecha": a["fecha"]})
+
+    if not todos_picks:
+        st.info("👈 Analiza partidos primero")
+    else:
+        modo = st.radio(
+            "Modo de construcción:",
+            ["✋ Manual", "🎯 Por cuota objetivo"],
+            horizontal=True,
+        )
+
+        # ---------- MANUAL ----------
+        if modo == "✋ Manual":
+            st.caption("Selecciona las patas. No puedes combinar 2 picks del mismo partido.")
+
+            opciones = {}
+            for i, p in enumerate(todos_picks):
+                label = (f"{p['partido']} → {p['market']}: {p['selection']} "
+                         f"@{p.get('cuota_real') or p['fair_odd']:.2f}")
+                opciones[label] = p
+
+            seleccion = st.multiselect(
+                "Elige las patas:",
+                list(opciones.keys()),
+                max_selections=6,
+                placeholder="Selecciona 2-6 patas",
+            )
+
+            if len(seleccion) >= 2:
+                patas = [opciones[s] for s in seleccion]
+                partidos_unicos = set(p["partido"] for p in patas)
+
+                if len(partidos_unicos) < len(patas):
+                    st.error("❌ No puedes combinar 2 picks del mismo partido")
+                else:
+                    cuota_total = 1.0
+                    prob_total = 1.0
+                    for p in patas:
+                        cuota_total *= p.get("cuota_real") or p["fair_odd"]
+                        prob_total *= p["prob"] / 100
+
+                    prob_pct = round(prob_total * 100, 2)
+                    cuota_justa_combo = round(1 / prob_total, 2) if prob_total > 0 else 0
+                    edge_combo = round((cuota_total / cuota_justa_combo - 1) * 100, 1) if cuota_justa_combo > 0 else 0
+
+                    st.divider()
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Patas", len(patas))
+                    c2.metric("Cuota combinada", f"{cuota_total:.2f}")
+                    c3.metric("Probabilidad", f"{prob_pct}%")
+
+                    if edge_combo > 0:
+                        st.success(f"✅ Edge combinado: **+{edge_combo}%**")
+                    else:
+                        st.warning(f"⚠️ Edge combinado: **{edge_combo}%**")
+
+                    with st.expander("Ver patas", expanded=True):
+                        for p in patas:
+                            st.write(f"• **{p['partido']}** — {p['selection']} "
+                                     f"@{p.get('cuota_real') or p['fair_odd']:.2f} "
+                                     f"({p['prob']}%)")
+
+                    stake = st.number_input("Stake ($)", min_value=1.0,
+                                            value=10.0, step=1.0, key="man_stake")
+                    ganancia = stake * cuota_total
+                    st.info(f"💰 Ganancia potencial: **${ganancia:.2f}**")
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        if st.button("📲 Telegram", use_container_width=True,
+                                     key="tg_man"):
+                            msg = "🔗 *COMBINADA MANUAL*\n\n"
+                            for i, p in enumerate(patas, 1):
+                                msg += (f"{i}. {p['selection']}\n"
+                                        f"   _{p['partido']}_\n"
+                                        f"   @{p.get('cuota_real') or p['fair_odd']:.2f}\n")
+                            msg += f"\n📊 Cuota total: *{cuota_total:.2f}*"
+                            msg += f"\n💰 ${stake:.2f} → ${ganancia:.2f}"
+                            st.success("✅ Enviado") if tg_send(msg) else st.warning("⚠️ Falló")
+                    with col_b:
+                        if st.button("➕ Añadir al boleto", use_container_width=True,
+                                     key="bol_man"):
+                            for p in patas:
+                                st.session_state.boleto.append({
+                                    "partido": p["partido"],
+                                    "seleccion": f"[COMBO] {p['selection']}",
+                                    "cuota": p.get("cuota_real") or p["fair_odd"],
+                                })
+                            st.success(f"✅ {len(patas)} patas añadidas")
+                            st.rerun()
+
+        # ---------- POR CUOTA OBJETIVO ----------
+        else:
+            st.caption("El sistema busca la combinación que mejor se acerque a tu cuota objetivo.")
+
+            col1, col2 = st.columns(2)
+            with col1:
+                cuota_obj = st.number_input("Cuota objetivo", min_value=2.0,
+                                            max_value=100.0, value=5.0, step=0.5)
+            with col2:
+                max_legs = st.slider("Máximo de patas", 2, 8, 5)
+
+            with st.expander("⚙️ Filtros avanzados"):
+                prob_min_combo = st.slider("Prob mínima por pata (%)", 50.0,
+                                           80.0, 55.0, 1.0)
+                solo_con_edge = st.checkbox("Solo picks con edge > 0", value=True)
+
+            if st.button("🎯 Construir combinada óptima", type="primary"):
+                candidatos = [
+                    p for p in todos_picks
+                    if p["prob"] >= prob_min_combo
+                    and p["fair_odd"] >= 1.5
+                    and (not solo_con_edge or (p.get("edge_%") or 0) > 0)
+                ]
+
+                if len(candidatos) < 2:
+                    st.error("No hay suficientes picks que cumplan los filtros.")
+                else:
+                    candidatos.sort(
+                        key=lambda x: (x.get("edge_%") or 0, x["prob"]),
+                        reverse=True,
+                    )
+
+                    mejor = None
+                    mejor_diff = float('inf')
+
+                    for n_legs in range(2, max_legs + 1):
+                        sel = []
+                        partidos_usados = set()
+                        for p in candidatos:
+                            if len(sel) >= n_legs:
+                                break
+                            if p["partido"] in partidos_usados:
+                                continue
+                            sel.append(p)
+                            partidos_usados.add(p["partido"])
+
+                        if len(sel) < 2:
+                            continue
+
+                        prob_acum = 1.0
+                        for s in sel:
+                            prob_acum *= s["prob"] / 100.0
+
+                        cuota = 1 / prob_acum if prob_acum > 0 else 0
+                        diff = abs(cuota - cuota_obj)
+                        if cuota >= cuota_obj:
+                            diff *= 0.85
+
+                        if diff < mejor_diff:
+                            mejor_diff = diff
+                            mejor = (list(sel), prob_acum, cuota)
+
+                    if not mejor:
+                        st.error("No se pudo construir una combinada. Prueba otra cuota.")
+                    else:
+                        sel, prob_acum, cuota = mejor
+                        prob_pct = round(prob_acum * 100, 2)
+                        edge_final = round((cuota / (1/prob_acum) - 1) * 100, 1) if prob_acum > 0 else 0
+
+                        st.divider()
+                        st.success(f"✅ Combinada construida ({len(sel)} patas)")
+
+                        c1, c2, c3 = st.columns(3)
+                        c1.metric("Cuota real", f"{cuota:.2f}",
+                                  delta=f"obj: {cuota_obj}")
+                        c2.metric("Probabilidad", f"{prob_pct}%")
+                        c3.metric("Edge estimado", f"{edge_final}%")
+
+                        with st.expander("📋 Ver patas", expanded=True):
+                            for i, p in enumerate(sel, 1):
+                                st.write(f"**{i}. {p['selection']}**")
+                                st.caption(f"{p['partido']} · {p['fecha']}")
+                                st.caption(f"Prob: {p['prob']}% · "
+                                           f"@{p.get('cuota_real') or p['fair_odd']:.2f}")
+
+                        stake = st.number_input("Stake ($)", min_value=1.0,
+                                                value=10.0, step=1.0, key="auto_stake")
+                        ganancia = stake * cuota
+                        st.info(f"💰 Ganancia potencial: **${ganancia:.2f}**")
+
+                        col_a, col_b = st.columns(2)
+                        with col_a:
+                            if st.button("📲 Telegram", use_container_width=True,
+                                         key="tg_auto"):
+                                msg = "🔗 *COMBINADA AUTO*\n\n"
+                                msg += f"Cuota objetivo: {cuota_obj} · Real: {cuota:.2f}\n"
+                                msg += f"Prob: {prob_pct}% | Patas: {len(sel)}\n\n"
+                                for i, p in enumerate(sel, 1):
+                                    msg += (f"{i}. *{p['selection']}*\n"
+                                            f"   _{p['partido']}_\n"
+                                            f"   {p['prob']}% @"
+                                            f"{p.get('cuota_real') or p['fair_odd']:.2f}\n")
+                                msg += f"\n💰 ${stake:.2f} → ${ganancia:.2f}"
+                                st.success("✅ Enviado") if tg_send(msg) else st.warning("⚠️ Falló")
+                        with col_b:
+                            if st.button("➕ Boleto", use_container_width=True,
+                                         key="bol_auto"):
+                                for p in sel:
+                                    st.session_state.boleto.append({
+                                        "partido": p["partido"],
+                                        "seleccion": f"[COMBO] {p['selection']}",
+                                        "cuota": p.get("cuota_real") or p["fair_odd"],
+                                    })
+                                st.success(f"✅ {len(sel)} patas añadidas")
+                                st.rerun()
+
+
+# ============================================================
+#  TAB 4: BOLETO
+# ============================================================
+with t4:
     st.subheader("🧾 Boleto")
     if not st.session_state.boleto:
         st.info("Vacío")
@@ -807,9 +981,9 @@ with t2:
 
 
 # ============================================================
-#  TAB 3
+#  TAB 5: HISTORIAL
 # ============================================================
-with t3:
+with t5:
     st.subheader("📚 Historial")
     rend = stats_rendimiento()
     c1, c2, c3, c4 = st.columns(4)
@@ -849,7 +1023,8 @@ with t3:
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
                     c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
-                    c3.metric("C. real", f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
+                    c3.metric("C. real",
+                              f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
 
                     est = p["estado"]
                     if est == "GANADO": st.success("✅ GANADO")
