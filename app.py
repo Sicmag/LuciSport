@@ -1,16 +1,8 @@
-"""LuciSport AI — Supabase edition."""
+"""LuciSport AI — Supabase edition (cliente oficial)."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
 
-@st.cache_resource(ttl=600, show_spinner=False)
-def get_supabase():
-    url = _get("SUPABASE_URL")
-    key = _get("SUPABASE_KEY")
-    if not url or not key:
-        st.error("⚠️ Faltan SUPABASE_URL o SUPABASE_KEY en los Secrets")
-        st.stop()
-    return create_client(url, key)
 
 # ============================================================
 #  CONFIGURACIÓN
@@ -35,6 +27,8 @@ TELEGRAM_TOKEN = _get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = _get("TELEGRAM_CHAT_ID")
 ODDS_KEYS = [k.strip() for k in _get("ODDS_API_KEYS", "").split(",") if k.strip()]
 GROQ_KEY = _get("GROQ_API_KEY", "")
+SUPABASE_URL = _get("SUPABASE_URL")
+SUPABASE_KEY = _get("SUPABASE_KEY")
 HEADERS = {'X-Auth-Token': FOOTBALL_KEY}
 
 PROB_MIN, CUOTA_MIN = 55.0, 1.50
@@ -56,7 +50,10 @@ LIGAS = {"Premier League": "PL", "La Liga": "PD", "Serie A": "SA",
 # ============================================================
 @st.cache_resource(ttl=600, show_spinner=False)
 def get_supabase():
-    return st.connection("supabase", type=SupabaseConnection)
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        st.error("⚠️ Faltan SUPABASE_URL o SUPABASE_KEY en los Secrets")
+        st.stop()
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def guardar_pick(match, pick, estado="PENDIENTE"):
@@ -135,9 +132,12 @@ def stats_rendimiento():
             continue
         m = r["mercado"]
         mercados.setdefault(m, {"ganados": 0, "perdidos": 0, "anulados": 0})
-        if r["estado"] == "GANADO": mercados[m]["ganados"] += 1
-        elif r["estado"] == "PERDIDO": mercados[m]["perdidos"] += 1
-        else: mercados[m]["anulados"] += 1
+        if r["estado"] == "GANADO":
+            mercados[m]["ganados"] += 1
+        elif r["estado"] == "PERDIDO":
+            mercados[m]["perdidos"] += 1
+        else:
+            mercados[m]["anulados"] += 1
 
     por_mercado = []
     for m, d in mercados.items():
