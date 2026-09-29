@@ -1,5 +1,5 @@
-"""LuciSport AI."""
-import json, math, time, requests, streamlit as st
+"""LuciSport AI — con base de datos."""
+import json, math, time, sqlite3, os, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 
 def _get(key, default=""):
@@ -27,6 +27,8 @@ PROB_MIN, CUOTA_MIN = 55.0, 1.50
 MAX_PICKS, BANKROLL = 3, 100000
 LINEAS = [0.5, 1.5, 2.5, 3.5, 4.5]
 
+DB_PATH = "lucisport.db"
+
 SPORT_KEYS = {"PL": "soccer_epl", "PD": "soccer_spain_la_liga",
               "SA": "soccer_italy_serie_a", "BL1": "soccer_germany_bundesliga",
               "FL1": "soccer_france_ligue_one", "CL": "soccer_uefa_champs_league",
@@ -36,6 +38,174 @@ LIGAS = {"Premier League": "PL", "La Liga": "PD", "Serie A": "SA",
          "Bundesliga": "BL1", "Ligue 1": "FL1", "Champions": "CL",
          "Europa League": "ELI", "Libertadores": "CLI"}
 
+
+# ============================================================
+#  BASE DE DATOS
+# ============================================================
+def init_db():
+    con = sqlite3.connect(DB_PATH)
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS picks (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        match_id     TEXT NOT NULL,
+        fecha_partido TEXT,
+        liga         TEXT,
+        home         TEXT,
+        away         TEXT,
+        mercado      TEXT,
+        seleccion    TEXT,
+        prob_modelo  REAL,
+        cuota_justa  REAL,
+        cuota_real   REAL,
+        edge_pct     REAL,
+        stake_sug    REAL,
+        estado       TEXT DEFAULT 'PENDIENTE',
+        resultado_ft TEXT,
+        creado       TEXT,
+        resuelto     TEXT,
+        UNIQUE(match_id, mercado, seleccion)
+    );
+    CREATE INDEX IF NOT EXISTS idx_estado ON picks(estado);
+    CREATE INDEX IF NOT EXISTS idx_creado ON picks(creado);
+    CREATE INDEX IF NOT EXISTS idx_liga   ON picks(liga);
+    """)
+    con.commit()
+    con.close()
+
+
+def guardar_pick(match, pick, estado="PENDIENTE"):
+    """Guarda o actualiza un pick en la BD."""
+    match_id = f"{match['homeTeam']['id']}_{match['awayTeam']['id']}_{match.get('utcDate','')[:16]}"
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO picks
+              (match_id, fecha_partido, liga, home, away, mercado, seleccion,
+               prob_modelo, cuota_justa, cuota_real, edge_pct, stake_sug,
+               estado, creado)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(match_id, mercado, seleccion) DO UPDATE SET
+              prob_modelo=excluded.prob_modelo,
+              cuota_justa=excluded.cuota_justa,
+              cuota_real=excluded.cuota_real,
+              edge_pct=excluded.edge_pct,
+              stake_sug=excluded.stake_sug
+        """, (
+            match_id,
+            (match.get('utcDate') or '')[:16],
+            match.get('league_code', ''),
+            match['homeTeam']['name'],
+            match['awayTeam']['name'],
+            pick['market'],
+            pick['selection'],
+            pick['prob'],
+            pick['fair_odd'],
+            pick.get('cuota_real'),
+            pick.get('edge_%'),
+            pick.get('stake_sug'),
+            estado,
+            datetime.now(timezone.utc).isoformat(),
+        ))
+        con.commit()
+    except Exception as e:
+        st.warning(f"Error guardando pick: {e}")
+    finally:
+        con.close()
+
+
+def listar_picks(estado=None, limite=200):
+    """Devuelve picks filtrados por estado."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    if estado:
+        cur.execute("""SELECT id, fecha_partido, liga, home, away, mercado,
+                              seleccion, prob_modelo, cuota_justa, cuota_real,
+                              edge_pct, estado, creado
+                       FROM picks WHERE estado=?
+                       ORDER BY creado DESC LIMIT ?""", (estado, limite))
+    else:
+        cur.execute("""SELECT id, fecha_partido, liga, home, away, mercado,
+                              seleccion, prob_modelo, cuota_justa, cuota_real,
+                              edge_pct, estado, creado
+                       FROM picks ORDER BY creado DESC LIMIT ?""", (limite,))
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
+
+def stats_por_estado():
+    """Cuenta picks por estado."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT estado, COUNT(*) FROM picks GROUP BY estado")
+    res = dict(cur.fetchall())
+    con.close()
+    return res
+
+
+def cambiar_estado(pick_id, nuevo_estado):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""UPDATE picks SET estado=?, resuelto=?
+                   WHERE id=?""",
+                (nuevo_estado, datetime.now(timezone.utc).isoformat(), pick_id))
+    con.commit()
+    con.close()
+
+
+def eliminar_pick(pick_id):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("DELETE FROM picks WHERE id=?", (pick_id,))
+    con.commit()
+    con.close()
+
+
+def stats_rendimiento():
+    """Devuelve el rendimiento por mercado y global."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""SELECT estado, COUNT(*) FROM picks
+                   WHERE estado IN ('GANADO','PERDIDO','ANULADO')
+                   GROUP BY estado""")
+    res = dict(cur.fetchall())
+    ganados = res.get('GANADO', 0)
+    perdidos = res.get('PERDIDO', 0)
+    anulados = res.get('ANULADO', 0)
+    total_resueltos = ganados + perdidos
+    hit_rate = round(ganados / total_resueltos * 100, 1) if total_resueltos else 0
+
+    # Por mercado
+    cur.execute("""SELECT mercado,
+                     SUM(CASE WHEN estado='GANADO' THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN estado='PERDIDO' THEN 1 ELSE 0 END),
+                     SUM(CASE WHEN estado='ANULADO' THEN 1 ELSE 0 END)
+                   FROM picks
+                   WHERE estado IN ('GANADO','PERDIDO','ANULADO')
+                   GROUP BY mercado""")
+    mercados = []
+    for m, g, p, a in cur.fetchall():
+        tot = (g or 0) + (p or 0)
+        mercados.append({
+            "mercado": m, "ganados": g or 0, "perdidos": p or 0,
+            "anulados": a or 0,
+            "hit": round((g or 0) / tot * 100, 1) if tot else 0,
+        })
+
+    con.close()
+    return {
+        "ganados": ganados, "perdidos": perdidos, "anulados": anulados,
+        "hit_rate": hit_rate, "por_mercado": mercados,
+    }
+
+
+init_db()
+
+
+# ============================================================
+#  MODELO MATEMÁTICO
+# ============================================================
 def poisson(lam, k):
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
@@ -70,12 +240,15 @@ def kelly(prob, odd, bank=BANKROLL):
     return round(bank * min(f * 0.25, 0.05), 2)
 
 _LAST = [0.0]
-
 def _rl(t=1.5):
     e = time.time() - _LAST[0]
     if e < t: time.sleep(t - e)
     _LAST[0] = time.time()
 
+
+# ============================================================
+#  DATOS DE API
+# ============================================================
 @st.cache_data(ttl=43200, show_spinner=False)
 def get_team_data(tid):
     _rl()
@@ -106,6 +279,7 @@ def get_team_data(tid):
                 "gf_2t": max((gf - gf1) / n, 0.01), "gc_2t": max((gc - gc1) / n, 0.01)}
     except Exception:
         return d
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_odds(sport_key):
@@ -170,6 +344,10 @@ def get_odds(match):
         if d["Under"]: out["Goles totales"]["-" + pt] = avg(d["Under"])
     return {k: v for k, v in out.items() if v}
 
+
+# ============================================================
+#  ANÁLISIS
+# ============================================================
 def analizar(match):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     hs = get_team_data(match['homeTeam']['id'])
@@ -221,12 +399,12 @@ def analizar(match):
     top = sorted(pm.values(), key=lambda x: x["prob"], reverse=True)[:MAX_PICKS]
     return top
 
-SYS = """Analista de apuestas. Devuelve JSON:
-{"analisis":"3 frases","pick_recomendado":"x","confianza":7,"riesgos":["r1"]}"""
 
 def ia_analizar(match, picks):
     if not GROQ_KEY: return None
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
+    sys_prompt = """Analista de apuestas. Devuelve JSON:
+{"analisis":"3 frases","pick_recomendado":"x","confianza":7,"riesgos":["r1"]}"""
     txt = f"PARTIDO: {h} vs {a}\nPICKS:\n"
     for p in picks[:5]:
         txt += f"- [{p['market']}] {p['selection']}: {p['prob']}%\n"
@@ -235,7 +413,7 @@ def ia_analizar(match, picks):
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}"},
             json={"model": "llama-3.3-70b-versatile",
-                  "messages": [{"role": "system", "content": SYS},
+                  "messages": [{"role": "system", "content": sys_prompt},
                                {"role": "user", "content": txt}],
                   "temperature": 0.3, "max_tokens": 500,
                   "response_format": {"type": "json_object"}},
@@ -245,6 +423,7 @@ def ia_analizar(match, picks):
     except Exception:
         pass
     return None
+
 
 def tg_send(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT: return False
@@ -257,8 +436,13 @@ def tg_send(msg):
     except Exception:
         return False
 
+
+# ============================================================
+#  UI
+# ============================================================
 st.set_page_config(page_title="LuciSport AI", page_icon="⚽", layout="wide",
                    initial_sidebar_state="collapsed")
+
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def cargar_partidos(cod, dias=5):
@@ -272,6 +456,7 @@ def cargar_partidos(cod, dias=5):
     except Exception:
         return []
 
+
 if "partidos" not in st.session_state:
     st.session_state.partidos = []
 if "analisis" not in st.session_state:
@@ -279,6 +464,8 @@ if "analisis" not in st.session_state:
 if "boleto" not in st.session_state:
     st.session_state.boleto = []
 
+
+# ---------- SIDEBAR ----------
 with st.sidebar:
     st.title("⚽ LuciSport AI")
     liga = st.selectbox("Liga", list(LIGAS.keys()))
@@ -291,6 +478,16 @@ with st.sidebar:
             st.session_state.partidos = cargar_partidos(LIGAS[liga], dias)
             st.session_state.analisis = []
         st.rerun()
+    st.divider()
+
+    # Stats rápidas
+    s = stats_por_estado()
+    st.caption(
+        f"📊 BD: {s.get('PENDIENTE', 0)} pend · "
+        f"{s.get('GANADO', 0)} gan · {s.get('PERDIDO', 0)} per · "
+        f"{s.get('ANULADO', 0)} anul"
+    )
+
     st.divider()
     st.subheader("🧾 Boleto")
     if not st.session_state.boleto:
@@ -313,11 +510,17 @@ with st.sidebar:
             st.session_state.boleto = []
             st.rerun()
 
+
+# ---------- CUERPO ----------
 st.title("⚽ LuciSport AI")
-st.caption("Dixon-Coles + Groq + Odds API")
+st.caption("Dixon-Coles + Groq + Odds API + Base de datos")
 
-t1, t2 = st.tabs(["📅 Partidos", "📊 Boleto"])
+t1, t2, t3 = st.tabs(["📅 Partidos", "🧾 Boleto", "📚 Historial"])
 
+
+# ============================================================
+#  TAB 1: PARTIDOS
+# ============================================================
 with t1:
     if not st.session_state.partidos:
         st.info("👈 Menú » → elige liga → Cargar partidos")
@@ -340,6 +543,9 @@ with t1:
                     with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
                         try:
                             picks = analizar(m)
+                            # Guardar cada pick en BD
+                            for p in picks:
+                                guardar_pick(m, p)
                             ia = ia_analizar(m, picks) if usar_ia else None
                             res.append({
                                 "partido": f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}",
@@ -359,6 +565,7 @@ with t1:
                                 "traceback": traceback.format_exc(),
                             })
                 st.session_state.analisis = res
+                st.success(f"✅ {len(res)} partidos analizados y guardados en BD")
                 st.rerun()
 
         for a in st.session_state.analisis:
@@ -380,21 +587,18 @@ with t1:
                             st.write(f"**{p['market']}** — {p['selection']}")
                             x1, x2, x3 = st.columns(3)
                             x1.metric("Prob", f"{p['prob']}%")
-                            x2.metric("Cuota justa", f"{p['fair_odd']:.2f}",
-                                      help="Lo que el modelo cree que vale")
+                            x2.metric("Cuota justa", f"{p['fair_odd']:.2f}")
                             cr = p.get("cuota_real")
                             if cr:
                                 edge = p.get("edge_%", 0)
                                 x3.metric("Cuota real", f"{cr:.2f}",
-                                          delta=f"{edge:+.1f}%",
-                                          help="Cuota de casas + edge (valor esperado)")
+                                          delta=f"{edge:+.1f}%")
                             else:
-                                x3.metric("Cuota real", "—",
-                                          help="Sin datos de Odds API (partido fuera de ventana o liga sin cobertura)")
+                                x3.metric("Cuota real", "—")
                             if cr and p.get("edge_%", 0) > 5:
-                                st.success(f"✅ VALUE BET: +{p['edge_%']:.1f}% sobre cuota justa")
+                                st.success(f"✅ VALUE: +{p['edge_%']:.1f}%")
                             elif cr and p.get("edge_%", 0) < -5:
-                                st.warning(f"⚠️ Cuota baja: {p['edge_%']:.1f}% bajo cuota justa")
+                                st.warning(f"⚠️ Cuota baja: {p['edge_%']:.1f}%")
                             if st.button("➕ Boleto", key=f"a_{a['partido']}_{j}"):
                                 st.session_state.boleto.append({
                                     "partido": a["partido"],
@@ -414,6 +618,10 @@ with t1:
                         if ia.get("riesgos"):
                             st.warning("⚠️ " + " · ".join(ia["riesgos"]))
 
+
+# ============================================================
+#  TAB 2: BOLETO
+# ============================================================
 with t2:
     st.subheader("🧾 Boleto")
     if not st.session_state.boleto:
@@ -435,3 +643,95 @@ with t2:
                 msg += f"{i}. {b['seleccion']} · @{b['cuota']:.2f}\n"
             msg += f"\nCuota: *{ct:.2f}* | Ganancia: {stake * ct:.2f}"
             st.success("✅ Enviado") if tg_send(msg) else st.warning("⚠️ Falló")
+
+
+# ============================================================
+#  TAB 3: HISTORIAL
+# ============================================================
+with t3:
+    st.subheader("📚 Historial de picks")
+
+    # ----- Resumen general -----
+    rend = stats_rendimiento()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("✅ Ganados", rend["ganados"])
+    c2.metric("❌ Perdidos", rend["perdidos"])
+    c3.metric("⭕ Anulados", rend["anulados"])
+    c4.metric("🎯 Hit rate", f"{rend['hit_rate']}%")
+
+    if rend["por_mercado"]:
+        with st.expander("📊 Rendimiento por mercado"):
+            for m in rend["por_mercado"]:
+                st.write(
+                    f"**{m['mercado']}** — "
+                    f"✅ {m['ganados']} · ❌ {m['perdidos']} · "
+                    f"⭕ {m['anulados']} → Hit **{m['hit']}%**"
+                )
+
+    st.divider()
+
+    # ----- Filtros -----
+    filtro = st.radio(
+        "Filtrar por estado:",
+        ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
+        horizontal=True,
+    )
+
+    estado = None if filtro == "Todos" else filtro
+    picks = listar_picks(estado=estado)
+
+    if not picks:
+        st.info(f"No hay picks con estado **{filtro}**")
+    else:
+        st.caption(f"Mostrando {len(picks)} picks")
+
+        # Tabla con acciones por pick
+        for row in picks:
+            (pid, fecha, lg, home, away, mercado, seleccion,
+             prob, cuota_justa, cuota_real, edge, estado_actual, creado) = row
+
+            with st.container(border=True):
+                col_info, col_acc = st.columns([3, 2])
+
+                with col_info:
+                    st.write(f"**{home} vs {away}**")
+                    st.caption(f"🕐 {fecha} · {lg}")
+                    st.write(f"🎯 {mercado}: **{seleccion}**")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Prob", f"{prob:.0f}%")
+                    c2.metric("C. justa", f"{cuota_justa:.2f}")
+                    c3.metric("C. real", f"{cuota_real:.2f}" if cuota_real else "—")
+
+                    # Color del estado
+                    if estado_actual == "GANADO":
+                        st.success("✅ GANADO")
+                    elif estado_actual == "PERDIDO":
+                        st.error("❌ PERDIDO")
+                    elif estado_actual == "ANULADO":
+                        st.info("⭕ ANULADO")
+                    else:
+                        st.warning("⏳ PENDIENTE")
+
+                with col_acc:
+                    st.write("**Cambiar estado:**")
+                    b1, b2, b3 = st.columns(3)
+                    with b1:
+                        if st.button("✅", key=f"g_{pid}", help="Marcar GANADO",
+                                     use_container_width=True):
+                            cambiar_estado(pid, "GANADO")
+                            st.rerun()
+                    with b2:
+                        if st.button("❌", key=f"p_{pid}", help="Marcar PERDIDO",
+                                     use_container_width=True):
+                            cambiar_estado(pid, "PERDIDO")
+                            st.rerun()
+                    with b3:
+                        if st.button("⭕", key=f"a_{pid}", help="Marcar ANULADO",
+                                     use_container_width=True):
+                            cambiar_estado(pid, "ANULADO")
+                            st.rerun()
+
+                    if st.button("🗑️ Eliminar", key=f"d_{pid}",
+                                 use_container_width=True):
+                        eliminar_pick(pid)
+                        st.rerun()
