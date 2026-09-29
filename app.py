@@ -1,6 +1,7 @@
-"""LuciSport AI — con base de datos."""
-import json, math, time, sqlite3, os, requests, streamlit as st
+"""LuciSport AI — Supabase edition."""
+import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
+from st_supabase_connection import SupabaseConnection, execute_query
 
 def _get(key, default=""):
     try:
