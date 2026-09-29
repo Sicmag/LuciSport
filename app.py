@@ -22,7 +22,6 @@ def _get(key, default=""):
     return os.getenv(key, default)
 
 
-# ---------- API KEYS ----------
 FOOTBALL_KEY = _get("FOOTBALL_API_KEY")
 TELEGRAM_TOKEN = _get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = _get("TELEGRAM_CHAT_ID")
@@ -32,14 +31,26 @@ DOLLAR_KEY = _get("DOLLAR_API_KEY", "")
 
 HEADERS = {'X-Auth-Token': FOOTBALL_KEY}
 
-# ---------- 5DOLLARFOOTBALL (AJUSTA SEGÚN TU DOC) ----------
-DOLLAR_BASE = "https://api.5dollarfootball.com"   # ← tu URL base real
-DOLLAR_AUTH_MODE = "query"   # opciones: "query" | "header_bearer" | "header_custom"
-DOLLAR_AUTH_PARAM = "api_key"   # si query
-DOLLAR_AUTH_HEADER = "Authorization"   # si header
-DOLLAR_ENDPOINT_MATCHES = "/matches"    # endpoint de partidos
-DOLLAR_ENDPOINT_STATS = "/matches/{id}/stats"  # stats por partido
-DOLLAR_ENDPOINT_ODDS = "/matches/{id}/odds"    # cuotas por partido
+# ---------- 5DOLLARFOOTBALL (config real) ----------
+DOLLAR_BASE = "https://api.5dollarfootballapi.com/v1"
+DOLLAR_LEAGUES = {
+    "PL":  "4160026622",   # Premier League
+    "PD":  "421821298",    # La Liga
+    "SA":  "3405541143",   # Serie A
+    "BL1": "68637048",     # Bundesliga
+    "FL1": "3614399544",   # Ligue 1
+}
+
+# Promedios de liga para córners/tarjetas (estimaciones iniciales)
+# Se usarán si no hay datos específicos del equipo
+PROM_CORNERS_LIGA = {
+    "PL": 10.5, "PD": 9.5, "SA": 10.0, "BL1": 10.5, "FL1": 9.8,
+    "CL": 10.5, "ELI": 10.0, "CLI": 9.8,
+}
+PROM_CARDS_LIGA = {
+    "PL": 4.2, "PD": 5.5, "SA": 4.8, "BL1": 4.0, "FL1": 4.5,
+    "CL": 4.5, "ELI": 4.5, "CLI": 5.5,
+}
 
 # ---------- PARÁMETROS DEL MODELO ----------
 PROB_MIN, CUOTA_MIN = 55.0, 1.50
@@ -227,6 +238,85 @@ def _rl(t=1.5):
 
 
 # ============================================================
+#  5DOLLARFOOTBALL
+# ============================================================
+def _ts_to_iso(ts):
+    """Convierte unix seconds a string legible."""
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%dT%H:%M")
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def dollar_get_fixtures(liga_id, dias_offset=0):
+    """
+    Trae partidos de 5DollarFootball para 24h a partir de hoy+dias_offset.
+    Devuelve lista de dicts listos para usar.
+    """
+    if not DOLLAR_KEY or not liga_id:
+        return []
+    # Unix seconds: inicio del día UTC + offset
+    ahora = datetime.now(timezone.utc)
+    inicio = (ahora + timedelta(days=dias_offset)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    fin = inicio + timedelta(hours=24)
+    start_ts = int(inicio.timestamp())
+    end_ts = int(fin.timestamp())
+
+    try:
+        r = requests.get(f"{DOLLAR_BASE}/fixtures",
+                         params={"api_key": DOLLAR_KEY,
+                                 "start_time": start_ts,
+                                 "end_time": end_ts,
+                                 "league": liga_id,
+                                 "per_page": 50},
+                         timeout=15)
+        data = r.json() if r.status_code == 200 else {}
+    except Exception:
+        return []
+
+    if not data.get("success"):
+        return []
+
+    out = []
+    for f in data.get("data", []):
+        home = (f.get("teams") or {}).get("home") or {}
+        away = (f.get("teams") or {}).get("away") or {}
+        lg = (f.get("league") or {}).get("name", "")
+        kickoff = _ts_to_iso(f.get("kickoff_ts", 0))
+        out.append({
+            "id_dollar": f.get("id"),
+            "home": home.get("name", "?"),
+            "away": away.get("name", "?"),
+            "home_id_dollar": home.get("id"),
+            "away_id_dollar": away.get("id"),
+            "liga_nombre": lg,
+            "kickoff": kickoff,
+            "status": f.get("status", "scheduled"),
+            "goals_home": (f.get("goals") or {}).get("home", 0),
+            "goals_away": (f.get("goals") or {}).get("away", 0),
+            "corners_home": (f.get("corners") or {}).get("home", 0),
+            "corners_away": (f.get("corners") or {}).get("away", 0),
+            "cards_home": ((f.get("cards") or {}).get("yellow") or {}).get("home", 0),
+            "cards_away": ((f.get("cards") or {}).get("yellow") or {}).get("away", 0),
+        })
+    return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def dollar_get_team_form(team_name, liga_codigo, dias_atras=30):
+    """
+    Estima forma del equipo usando los datos de 5Dollar.
+    Solo funciona con partidos FUTUROS con status='finished'.
+    Como 5Dollar no da histórico, usa promedios de liga si no hay datos.
+    """
+    # Devuelve None para que el modelo use los promedios de liga
+    # Cuando la app acumule histórico real en Supabase, se puede mejorar
+    return None
+
+
+# ============================================================
 #  FOOTBALL-DATA.ORG
 # ============================================================
 @st.cache_data(ttl=43200, show_spinner=False)
@@ -272,121 +362,6 @@ def cargar_partidos(cod, dias=5):
         return r.json().get("matches", []) if r.status_code == 200 else []
     except Exception:
         return []
-
-
-# ============================================================
-#  5DOLLARFOOTBALL
-# ============================================================
-def _dollar_auth():
-    """Devuelve (params, headers) según configuración."""
-    params, headers = {}, {}
-    if not DOLLAR_KEY:
-        return params, headers
-    if DOLLAR_AUTH_MODE == "query":
-        params[DOLLAR_AUTH_PARAM] = DOLLAR_KEY
-    elif DOLLAR_AUTH_MODE == "header_bearer":
-        headers[DOLLAR_AUTH_HEADER] = f"Bearer {DOLLAR_KEY}"
-    elif DOLLAR_AUTH_MODE == "header_custom":
-        headers[DOLLAR_AUTH_HEADER] = DOLLAR_KEY
-    return params, headers
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def dollar_get(endpoint, extra_params=None):
-    """GET genérico a 5DollarFootball. Devuelve dict o None."""
-    if not DOLLAR_KEY:
-        return None
-    params, headers = _dollar_auth()
-    if extra_params:
-        params.update(extra_params)
-    try:
-        r = requests.get(f"{DOLLAR_BASE}{endpoint}",
-                         params=params, headers=headers, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-        return {"_error": f"HTTP {r.status_code}", "_body": r.text[:200]}
-    except Exception as e:
-        return {"_error": str(e)}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_corners_cards_team(team_name):
-    """
-    Devuelve {'corners': X, 'cards': Y} promedio de un equipo.
-    El endpoint varía según la API — ajusta la lógica si es necesario.
-    """
-    if not DOLLAR_KEY:
-        return None
-    data = dollar_get(DOLLAR_ENDPOINT_MATCHES, {"team": team_name, "limit": 10})
-    if not data or "_error" in data:
-        return None
-
-    # Heurística: la API suele devolver un array con partidos.
-    # Busca el patrón común {home, away, corners_home, corners_away, cards_home, cards_away}
-    partidos = data if isinstance(data, list) else data.get("matches") or data.get("data") or []
-    if not partidos:
-        return None
-
-    tot_corners = tot_cards = 0
-    n = 0
-    for p in partidos[:10]:
-        h = p.get("home") or p.get("home_team") or ""
-        if team_name.lower() in str(h).lower():
-            tot_corners += p.get("corners_home", 0) or 0
-            tot_cards += p.get("cards_home", 0) or 0
-        else:
-            tot_corners += p.get("corners_away", 0) or 0
-            tot_cards += p.get("cards_away", 0) or 0
-        n += 1
-
-    if n == 0:
-        return None
-    return {"corners": round(tot_corners / n, 2), "cards": round(tot_cards / n, 2)}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_cuotas_dollar(match):
-    """
-    Cuotas reales de 5DollarFootball. Estructura flexible.
-    Devuelve {mercado: {seleccion: cuota}} o {}.
-    """
-    if not DOLLAR_KEY:
-        return {}
-    # Intenta buscar el partido por nombre
-    h = match['homeTeam']['name']
-    a = match['awayTeam']['name']
-    data = dollar_get(DOLLAR_ENDPOINT_MATCHES, {"home": h, "away": a})
-    if not data or "_error" in data:
-        return {}
-
-    partidos = data if isinstance(data, list) else data.get("matches") or data.get("data") or []
-    if not partidos:
-        return {}
-
-    # Toma el primero que coincida
-    p = partidos[0]
-    match_id = p.get("id")
-    if not match_id:
-        return {}
-
-    odds_data = dollar_get(DOLLAR_ENDPOINT_ODDS.format(id=match_id))
-    if not odds_data or "_error" in odds_data:
-        return {}
-
-    # Estructura esperada: {markets: [{name, outcomes: [{name, price}]}]}
-    out = {}
-    markets = odds_data.get("markets") or odds_data.get("odds") or []
-    for m in markets:
-        m_name = m.get("name") or m.get("market") or ""
-        sel = {}
-        for o in m.get("outcomes", []):
-            nm = o.get("name") or o.get("selection") or ""
-            price = o.get("price") or o.get("odd")
-            if nm and price:
-                sel[nm] = float(price)
-        if sel:
-            out[m_name] = sel
-    return out
 
 
 # ============================================================
@@ -456,9 +431,9 @@ def get_odds_oddsapi(match):
 
 
 # ============================================================
-#  MOTOR DE ANÁLISIS (con mercados extra)
+#  MOTOR DE ANÁLISIS (con córners y tarjetas)
 # ============================================================
-def analizar(match):
+def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     hs = get_team_data(match['homeTeam']['id'])
     as_ = get_team_data(match['awayTeam']['id'])
@@ -484,13 +459,13 @@ def analizar(match):
         fo = round(1 / (pr / 100.0), 2) if pr > 0 else 0
         picks.append({"market": mk, "selection": sel, "prob": pr, "fair_odd": fo})
 
-    # ---------- 1X2 ----------
+    # 1X2
     add("1X2", f"Gana {h}", pL)
     add("1X2", f"Gana {a}", pV)
     add("1X2", f"1X {h}", pL + pE)
     add("1X2", f"X2 {a}", pV + pE)
 
-    # ---------- Goles totales / equipo / tiempos ----------
+    # Goles
     for mk, lam in [("Goles totales", tot), (f"Goles {h}", exH),
                     (f"Goles {a}", exA), ("Goles 1T", exH1 + exA1),
                     ("Goles 2T", exH2 + exA2)]:
@@ -499,38 +474,35 @@ def analizar(match):
             add(mk, f"+{ln}", po)
             add(mk, f"-{ln}", pu)
 
-    # ---------- BTTS ----------
+    # BTTS
     btts = round(((1 - poisson(exH, 0)) * (1 - poisson(exA, 0))) * 100, 1)
     add("BTTS", "Ambos marcan", btts)
 
-    # ---------- CÓRNERS y TARJETAS (5DollarFootball) ----------
-    ch = get_corners_cards_team(h)
-    ca = get_corners_cards_team(a)
-    if ch and ca:
-        # Córners totales
-        lam_corners = ch["corners"] + ca["corners"]
-        if lam_corners > 4:
-            for ln in LINEAS_CORNERS:
-                po, pu = over_under(lam_corners, ln)
-                add("Córners totales", f"+{ln}", po)
-                add("Córners totales", f"-{ln}", pu)
-            # Córners por equipo
-            for ln in [3.5, 4.5, 5.5, 6.5]:
-                po, _ = over_under(ch["corners"], ln)
-                add(f"Córners {h}", f"+{ln}", po)
-                po, _ = over_under(ca["corners"], ln)
-                add(f"Córners {a}", f"+{ln}", po)
+    # ---------- CÓRNERS (promedio de liga) ----------
+    prom_corners = PROM_CORNERS_LIGA.get(liga_codigo, 10.0)
+    lam_corners = prom_corners
+    for ln in LINEAS_CORNERS:
+        po, pu = over_under(lam_corners, ln)
+        add("Córners totales", f"+{ln}", po)
+        add("Córners totales", f"-{ln}", pu)
 
-        # Tarjetas totales
-        lam_cards = ch["cards"] + ca["cards"]
-        if lam_cards > 1.5:
-            for ln in LINEAS_TARJETAS:
-                po, pu = over_under(lam_cards, ln)
-                add("Tarjetas totales", f"+{ln}", po)
-                add("Tarjetas totales", f"-{ln}", pu)
+    # Córners por equipo (mitad del promedio + home advantage)
+    lam_corners_home = prom_corners / 2 * 1.15
+    lam_corners_away = prom_corners / 2 * 0.85
+    for ln in [3.5, 4.5, 5.5, 6.5]:
+        po, _ = over_under(lam_corners_home, ln)
+        add(f"Córners {h}", f"+{ln}", po)
+        po, _ = over_under(lam_corners_away, ln)
+        add(f"Córners {a}", f"+{ln}", po)
 
-    # ---------- CUOTAS REALES ----------
-    # 1. Odds API (para 1X2 y goles totales)
+    # ---------- TARJETAS (promedio de liga) ----------
+    prom_cards = PROM_CARDS_LIGA.get(liga_codigo, 4.5)
+    for ln in LINEAS_TARJETAS:
+        po, pu = over_under(prom_cards, ln)
+        add("Tarjetas totales", f"+{ln}", po)
+        add("Tarjetas totales", f"-{ln}", pu)
+
+    # ---------- CUOTAS REALES (Odds API) ----------
     try:
         cuotas_oddsapi = get_odds_oddsapi(match)
         for p in picks:
@@ -541,31 +513,33 @@ def analizar(match):
     except Exception:
         pass
 
-    # 2. 5DollarFootball (para córners y tarjetas)
-    try:
-        cuotas_dollar = get_cuotas_dollar(match)
-        for p in picks:
-            if not p.get("cuota_real") and p["market"] in cuotas_dollar \
-                    and p["selection"] in cuotas_dollar[p["market"]]:
-                p["cuota_real"] = cuotas_dollar[p["market"]][p["selection"]]
-                if p["fair_odd"] > 0:
-                    p["edge_%"] = round((p["cuota_real"] / p["fair_odd"] - 1) * 100, 2)
-    except Exception:
-        pass
-
     # ---------- FILTRAR + TOP ----------
     validos = [p for p in picks if p["prob"] >= PROB_MIN and p["fair_odd"] >= CUOTA_MIN]
     pm = {}
     for p in validos:
-        # Nos quedamos con el mejor pick por combinación mercado+línea
         key = f"{p['market']}|{p['selection']}"
         if key not in pm or p["prob"] > pm[key]["prob"]:
             pm[key] = p
-    top = sorted(pm.values(), key=lambda x: (x.get("edge_%") or 0, x["prob"]),
+    top = sorted(pm.values(),
+                 key=lambda x: (x.get("edge_%") or 0, x["prob"]),
                  reverse=True)[:MAX_PICKS]
     for p in top:
         p["stake_sug"] = kelly(p["prob"], p["fair_odd"])
     return top
+
+
+def convertir_dollar_a_football(d_fix, liga_codigo):
+    """Adapta un fixture de 5Dollar al formato de football-data.org."""
+    return {
+        "homeTeam": {"id": d_fix.get("home_id_dollar") or hash(d_fix["home"]) % 1000000,
+                     "name": d_fix["home"]},
+        "awayTeam": {"id": d_fix.get("away_id_dollar") or hash(d_fix["away"]) % 1000000,
+                     "name": d_fix["away"]},
+        "utcDate": d_fix.get("kickoff", ""),
+        "status": d_fix.get("status", "SCHEDULED").upper(),
+        "league_code": liga_codigo,
+        "_dollar_id": d_fix.get("id_dollar"),
+    }
 
 
 def ia_analizar(match, picks):
@@ -617,23 +591,47 @@ if "analisis" not in st.session_state:
     st.session_state.analisis = []
 if "boleto" not in st.session_state:
     st.session_state.boleto = []
+if "fuente" not in st.session_state:
+    st.session_state.fuente = "football-data.org"
 
 
 # ---------- SIDEBAR ----------
 with st.sidebar:
     st.title("⚽ LuciSport AI")
-    liga = st.selectbox("Liga", list(LIGAS.keys()))
+
+    fuente = st.radio("Fuente de partidos:",
+                      ["football-data.org", "5DollarFootballAPI"],
+                      index=0, horizontal=False)
+    st.session_state.fuente = fuente
+
+    liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
+    liga_codigo = LIGAS[liga_nombre]
+
     dias = st.slider("Días a futuro", 1, 14, 5)
     usar_ia = st.toggle("IA (Groq)", value=False)
     max_p = st.slider("Máx. partidos", 1, 5, 1)
+
     st.divider()
     if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
-        with st.spinner("Cargando..."):
-            st.session_state.partidos = cargar_partidos(LIGAS[liga], dias)
+        with st.spinner(f"Cargando desde {fuente}..."):
+            if fuente == "5DollarFootballAPI":
+                liga_id = DOLLAR_LEAGUES.get(liga_codigo)
+                if not liga_id:
+                    st.error(f"5Dollar no cubre {liga_codigo}")
+                    st.session_state.partidos = []
+                else:
+                    partidos = []
+                    for offset in range(min(dias, 7)):
+                        fixtures = dollar_get_fixtures(liga_id, offset)
+                        for f in fixtures:
+                            partidos.append(convertir_dollar_a_football(f, liga_codigo))
+                    st.session_state.partidos = partidos
+            else:
+                st.session_state.partidos = cargar_partidos(liga_codigo, dias)
             st.session_state.analisis = []
         st.rerun()
-    st.divider()
 
+    st.divider()
     s = stats_por_estado()
     st.caption(
         f"📊 BD: {s.get('PENDIENTE', 0)} pend · "
@@ -642,13 +640,16 @@ with st.sidebar:
     )
 
     with st.expander("🔬 Debug APIs"):
-        st.caption(f"Supabase URL: `{_limpiar_url(_get('SUPABASE_URL',''))}`")
+        st.caption(f"Fuente: **{fuente}**")
+        st.caption(f"Supabase: `{_limpiar_url(_get('SUPABASE_URL',''))[:35]}...`")
         st.caption(f"5Dollar key: {'✅' if DOLLAR_KEY else '❌'}")
         st.caption(f"Odds API: {len(ODDS_KEYS)} keys")
         st.caption(f"Groq: {'✅' if GROQ_KEY else '❌'}")
         if st.button("🧪 Probar 5Dollar"):
-            r = dollar_get(DOLLAR_ENDPOINT_MATCHES, {"limit": 3})
-            st.json(r if r else {"error": "sin datos"})
+            d = dollar_get_fixtures(DOLLAR_LEAGUES["PL"], 0)
+            st.write(f"{len(d)} partidos encontrados")
+            if d:
+                st.json(d[:2])
 
     st.divider()
     st.subheader("🧾 Boleto")
@@ -684,11 +685,11 @@ t1, t2, t3 = st.tabs(["📅 Partidos", "🧾 Boleto", "📚 Historial"])
 # ============================================================
 with t1:
     if not st.session_state.partidos:
-        st.info("👈 Menú » → elige liga → Cargar partidos")
+        st.info("👈 Menú » → elige liga y fuente → Cargar partidos")
     else:
-        st.success(f"{len(st.session_state.partidos)} partidos en **{liga}**")
-        for m in st.session_state.partidos:
-            m['league_code'] = LIGAS[liga]
+        st.success(f"{len(st.session_state.partidos)} partidos en "
+                   f"**{liga_nombre}** (fuente: {st.session_state.fuente})")
+
         ops = {f"{p['homeTeam']['name']} vs {p['awayTeam']['name']} · "
                f"{(p.get('utcDate') or '')[:16]}": i
                for i, p in enumerate(st.session_state.partidos)}
@@ -703,7 +704,7 @@ with t1:
                     m = st.session_state.partidos[ops[s]]
                     with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
                         try:
-                            picks = analizar(m)
+                            picks = analizar(m, liga_codigo)
                             for p in picks:
                                 guardar_pick(m, p)
                             ia = ia_analizar(m, picks) if usar_ia else None
