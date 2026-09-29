@@ -1,5 +1,5 @@
 # =============================================================
-#  LUCI SPORT 4.5 — versión unificada
+#  LUCI SPORT 4.5 — sin SofaScore
 # =============================================================
 import os, math, time, sqlite3, requests, json, hashlib
 from datetime import datetime, timedelta, timezone
@@ -82,21 +82,8 @@ def init_db():
         voids       INTEGER DEFAULT 0,
         updated_at  TEXT
     );
-    CREATE TABLE IF NOT EXISTS ladder (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        paso            INTEGER NOT NULL,
-        bankroll_before REAL NOT NULL,
-        stake           REAL NOT NULL,
-        odd             REAL NOT NULL,
-        resultado       TEXT DEFAULT 'PENDING',
-        bankroll_after  REAL,
-        nota            TEXT,
-        created_at      TEXT NOT NULL
-    );
     CREATE INDEX IF NOT EXISTS idx_pred_result ON predictions(result);
     CREATE INDEX IF NOT EXISTS idx_pred_match  ON predictions(match_id);
-    CREATE INDEX IF NOT EXISTS idx_pred_home   ON predictions(home);
-    CREATE INDEX IF NOT EXISTS idx_pred_away   ON predictions(away);
     """)
     con.commit(); con.close()
 
@@ -177,36 +164,6 @@ def save_prediction(match, market, selection, prob, fair_odd, stake_pct,
     return match_id
 
 
-def ladder_status():
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT paso, bankroll_after FROM ladder ORDER BY paso DESC LIMIT 1")
-    row = cur.fetchone(); con.close()
-    return (0, BANKROLL_INICIAL) if not row else (row[0], row[1] or BANKROLL_INICIAL)
-
-
-def ladder_add(stake, odd, nota=""):
-    paso, bankroll = ladder_status()
-    con = db(); cur = con.cursor()
-    cur.execute("""INSERT INTO ladder(paso, bankroll_before, stake, odd, nota, created_at)
-                   VALUES(?,?,?,?,?,?)""",
-                (paso+1, bankroll, stake, odd, nota, _utcnow_iso()))
-    con.commit(); con.close()
-    return paso+1, bankroll
-
-
-def ladder_resolve(paso, gano):
-    con = db(); cur = con.cursor()
-    cur.execute("SELECT bankroll_before, stake, odd FROM ladder WHERE paso=?", (paso,))
-    row = cur.fetchone()
-    if not row: return None
-    bb, stake, odd = row
-    after = bb - stake + stake*odd if gano else bb - stake
-    cur.execute("UPDATE ladder SET resultado=?, bankroll_after=? WHERE paso=?",
-                ("WON" if gano else "LOST", after, paso))
-    con.commit(); con.close()
-    return after
-
-
 # =============================================================
 #  2. MODELO
 # =============================================================
@@ -246,13 +203,6 @@ def kelly_stake(prob_pct, odd, bankroll):
     f = (p*b - (1-p)) / b
     if f <= 0: return 0.0
     return round(bankroll * min(f * KELLY_FRACTION, KELLY_CAP), 2)
-
-
-def color_prob(p):
-    if p < 40: return R
-    if p < 60: return Y
-    if p < 80: return B
-    return G
 
 
 # =============================================================
@@ -304,23 +254,18 @@ def enviar_a_telegram(mensaje):
 
 
 # =============================================================
-#  5. DATOS DE API (football-data.org) — RATE LIMIT REDUCIDO
+#  5. DATOS DE API (football-data.org)
 # =============================================================
 _LAST_CALL = [0.0]
 
 
 def _rate_limit(min_interval=1.5):
     """Rate limit reducido a 1.5s. Con caché persistente solo se llama
-    1 vez por equipo cada 12h, así que no agotamos la API."""
+    1 vez por equipo cada 12h."""
     elapsed = time.time() - _LAST_CALL[0]
     if elapsed < min_interval:
         time.sleep(min_interval - elapsed)
     _LAST_CALL[0] = time.time()
-
-
-def _default_cards(team_id):
-    h = int(hashlib.md5(str(team_id).encode()).hexdigest(), 16)
-    return round(1.6 + (h % 13) * 0.1, 2)
 
 
 def get_deep_data(team_id):
@@ -355,28 +300,6 @@ def get_deep_data(team_id):
         cache_set(team_id, out); return out
     except (requests.RequestException, KeyError, TypeError):
         return default
-
-
-def get_cards_data(team_id):
-    _rate_limit()
-    url = f"https://api.football-data.org/v4/teams/{team_id}/matches?status=FINISHED&limit=15"
-    default = _default_cards(team_id)
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10).json()
-        matches = r.get("matches", [])
-        total, contados = 0, 0
-        for m in matches:
-            bookings = m.get("bookings")
-            if not bookings: continue
-            local = m['homeTeam']['id'] == team_id
-            cards = sum(1 for b in bookings
-                        if (b.get("team",{}).get("id") == m['homeTeam']['id']) == local)
-            total += cards; contados += 1
-        if contados > 0:
-            return total/contados, True
-        return default, False
-    except Exception:
-        return default, False
 
 
 # =============================================================
@@ -555,7 +478,7 @@ def get_cuotas_reales(match):
 
 
 # =============================================================
-#  6. AUTO-RESOLUCIÓN
+#  6. EVALUACIÓN (para resolver apuestas)
 # =============================================================
 def evaluar_seleccion(market, selection, home_name, away_name, ft_h, ft_a, ht_h, ht_a):
     sel = selection
@@ -569,4 +492,79 @@ def evaluar_seleccion(market, selection, home_name, away_name, ft_h, ft_a, ht_h,
             team = sel[5:].strip()
             if team == home_name: return "WON" if ft_h > ft_a else "LOST"
             if team == away_name: return "WON" if ft_a > ft_h else "LOST"
-        if sel.startswith("1X "): return "WON" if ft_h >= ft_a els
+        if sel.startswith("1X "): return "WON" if ft_h >= ft_a else "LOST"
+        if sel.startswith("X2 "): return "WON" if ft_a >= ft_h else "LOST"
+        return "VOID"
+
+    def _eval_ou(valor, linea_str):
+        linea = float(linea_str)
+        if linea_str.startswith("+"): return "WON" if valor > linea else "LOST"
+        if linea_str.startswith("-"): return "WON" if valor < linea else "LOST"
+        return "VOID"
+
+    if market == "Goles totales":
+        return _eval_ou(total, sel)
+
+    if market.startswith("Goles ") and "1T" not in market and "2T" not in market:
+        team = market.replace("Goles ", "").strip()
+        valor = ft_h if team == home_name else ft_a
+        return _eval_ou(valor, sel)
+
+    if market == "Goles 1T":
+        return _eval_ou((ht_h or 0) + (ht_a or 0), sel)
+
+    if market == "Goles 2T":
+        v = ((ft_h - (ht_h or 0)) + (ft_a - (ht_a or 0)))
+        return _eval_ou(v, sel)
+
+    return "VOID"
+
+
+# =============================================================
+#  7. MOTOR DE ANÁLISIS
+# =============================================================
+MODO_SILENCIOSO = False
+
+
+def _analizar_match(match, aplicar_calibracion=True, usar_cuotas_reales=True):
+    picks = []
+    h_n, a_n = match['homeTeam']['name'], match['awayTeam']['name']
+    h_s = get_deep_data(match['homeTeam']['id'])
+    a_s = get_deep_data(match['awayTeam']['id'])
+
+    exH = ((h_s['gf'] + a_s['gc']) / 2) * 1.10
+    exA = ((a_s['gf'] + h_s['gc']) / 2) * 0.95
+    total = exH + exA
+    exH_1t = ((h_s['gf_1t'] + a_s['gc_1t']) / 2) * 1.10
+    exA_1t = ((a_s['gf_1t'] + h_s['gc_1t']) / 2) * 0.95
+    exH_2t = ((h_s['gf_2t'] + a_s['gc_2t']) / 2) * 1.10
+    exA_2t = ((a_s['gf_2t'] + h_s['gc_2t']) / 2) * 0.95
+
+    mat = score_matrix(exH, exA)
+    pL = sum(mat[i][j] for i in range(9) for j in range(9) if i>j)*100
+    pV = sum(mat[i][j] for i in range(9) for j in range(9) if j>i)*100
+    pE = 100 - pL - pV
+    pL, pE, pV = round(pL), round(pE), round(pV)
+
+    def add(market, selection, prob_raw):
+        cal = get_calibration(market) if aplicar_calibracion else 1.0
+        prob = max(0.01, min(99.9, round(prob_raw * cal, 1)))
+        fair_odd = round(1 / (prob / 100.0), 2) if prob > 0 else 0
+        picks.append({"market": market, "selection": selection,
+                      "prob": prob, "fair_odd": fair_odd,
+                      "prob_raw": prob_raw, "calib": cal})
+
+    add("1X2", f"Gana {h_n}", pL)
+    add("1X2", f"Gana {a_n}", pV)
+    add("1X2", f"1X {h_n}", pL+pE)
+    add("1X2", f"X2 {a_n}", pV+pE)
+
+    def add_ou(market, lam, lineas=LINEAS):
+        for ln in lineas:
+            po, pu = over_under(lam, ln)
+            add(market, f"+{ln}", po)
+            add(market, f"-{ln}", pu)
+
+    add_ou("Goles totales", total)
+    add_ou(f"Goles {h_n}", exH, LINEAS_EQUIPO)
+    add_ou(
