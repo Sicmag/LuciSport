@@ -1,12 +1,9 @@
-"""LuciSport AI — versión simple y estable."""
+"""LuciSport AI — parte 1."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
 
 
-# ============================================================
-#  CONFIGURACIÓN
-# ============================================================
 def _get(key, default=""):
     try:
         if key in st.secrets:
@@ -44,9 +41,6 @@ LIGAS = {"Premier League": "PL", "La Liga": "PD", "Serie A": "SA",
          "Europa League": "ELI", "Libertadores": "CLI"}
 
 
-# ============================================================
-#  SUPABASE
-# ============================================================
 def _limpiar_url(url):
     if not url:
         return ""
@@ -166,9 +160,6 @@ def stats_rendimiento():
     }
 
 
-# ============================================================
-#  MODELO MATEMÁTICO
-# ============================================================
 def poisson(lam, k):
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
@@ -215,9 +206,6 @@ def _rl(t=1.5):
     _LAST[0] = time.time()
 
 
-# ============================================================
-#  DATOS API
-# ============================================================
 @st.cache_data(ttl=43200, show_spinner=False)
 def get_team_data(tid):
     _rl()
@@ -326,9 +314,6 @@ def get_odds_oddsapi(match):
     return {k: v for k, v in out.items() if v}
 
 
-# ============================================================
-#  MOTOR DE ANÁLISIS
-# ============================================================
 def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     hs = get_team_data(match['homeTeam']['id'])
@@ -370,7 +355,6 @@ def analizar(match, liga_codigo):
     btts = round(((1 - poisson(exH, 0)) * (1 - poisson(exA, 0))) * 100, 1)
     add("BTTS", "Ambos marcan", btts)
 
-    # Cuotas reales
     try:
         cuotas_oddsapi = get_odds_oddsapi(match)
         for p in picks:
@@ -385,7 +369,7 @@ def analizar(match, liga_codigo):
         p["stake_sug"] = kelly(p["prob"], p["fair_odd"])
 
     return picks
-
+    
 
 def ia_analizar(match, picks):
     if not GROQ_KEY: return None
@@ -428,9 +412,6 @@ def tg_send(msg):
         return False
 
 
-# ============================================================
-#  UI
-# ============================================================
 st.set_page_config(page_title="LuciSport AI", page_icon="⚽", layout="wide",
                    initial_sidebar_state="collapsed")
 
@@ -442,24 +423,19 @@ if "boleto" not in st.session_state:
     st.session_state.boleto = []
 
 
-# ---------- SIDEBAR ----------
 with st.sidebar:
     st.title("⚽ LuciSport AI")
-
     liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
     liga_codigo = LIGAS[liga_nombre]
-
     dias = st.slider("Días a futuro", 1, 14, 5)
     usar_ia = st.toggle("IA (Groq)", value=False)
     max_p = st.slider("Máx. partidos", 1, 5, 1)
-
     st.divider()
     if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
         with st.spinner("Cargando..."):
             st.session_state.partidos = cargar_partidos(liga_codigo, dias)
             st.session_state.analisis = []
         st.rerun()
-
     st.divider()
     s = stats_por_estado()
     st.caption(
@@ -467,12 +443,10 @@ with st.sidebar:
         f"{s.get('GANADO', 0)} gan · {s.get('PERDIDO', 0)} per · "
         f"{s.get('ANULADO', 0)} anul"
     )
-
     with st.expander("🔬 Debug APIs"):
         st.caption(f"Supabase: `{_limpiar_url(_get('SUPABASE_URL',''))[:35]}...`")
         st.caption(f"Odds API: {len(ODDS_KEYS)} keys")
         st.caption(f"Groq: {'✅' if GROQ_KEY else '❌'}")
-
     st.divider()
     st.subheader("🧾 Boleto")
     if not st.session_state.boleto:
@@ -496,32 +470,24 @@ with st.sidebar:
             st.rerun()
 
 
-# ---------- HEADER ----------
 st.title("⚽ LuciSport AI")
 st.caption("Dixon-Coles + Groq + Odds API + Supabase")
 
 t1, t2, t3 = st.tabs(["📅 Partidos", "🧾 Boleto", "📚 Historial"])
 
 
-# ============================================================
-#  TAB 1: PARTIDOS
-# ============================================================
 with t1:
     if not st.session_state.partidos:
         st.info("👈 Menú » → elige liga → Cargar partidos")
     else:
         st.success(f"{len(st.session_state.partidos)} partidos en **{liga_nombre}**")
-
         for m in st.session_state.partidos:
             m['league_code'] = liga_codigo
-
         ops = {f"{p['homeTeam']['name']} vs {p['awayTeam']['name']} · "
                f"{(p.get('utcDate') or '')[:16]}": i
                for i, p in enumerate(st.session_state.partidos)}
-
         sel = st.multiselect("Elige partidos", list(ops.keys())[:30],
                              max_selections=max_p)
-
         if st.button("🔍 Analizar", type="primary"):
             if not sel:
                 st.warning("Selecciona al menos 1")
@@ -532,9 +498,9 @@ with t1:
                     with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
                         try:
                             picks = analizar(m, liga_codigo)
-                            top_guardar = [p for p in picks
-                                           if p.get("edge_%", 0) > 3 and p["prob"] >= PROB_MIN][:5]
-                            for p in top_guardar:
+                            top = [p for p in picks
+                                   if p.get("edge_%", 0) > 3 and p["prob"] >= PROB_MIN][:5]
+                            for p in top:
                                 guardar_pick(m, p)
                             ia = ia_analizar(m, picks) if usar_ia else None
                             res.append({
@@ -551,4 +517,143 @@ with t1:
                                 "fecha": "",
                                 "picks": [],
                                 "ia": None,
-                            
+                                "error": f"{type(e).__name__}: {e}",
+                                "traceback": traceback.format_exc(),
+                            })
+                st.session_state.analisis = res
+                st.success(f"✅ {len(res)} partidos analizados")
+                st.rerun()
+        for a in st.session_state.analisis:
+            if a.get("error"):
+                st.error(f"❌ {a['partido']}: {a['error']}")
+                with st.expander("Traceback"):
+                    st.code(a.get("traceback", ""))
+                continue
+            with st.container(border=True):
+                st.subheader(a["partido"])
+                st.caption(f"🕐 {a['fecha']}")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("#### 📈 Picks del modelo")
+                    ordenados = sorted(a["picks"],
+                                       key=lambda x: (x.get("edge_%") or -999, x["prob"]),
+                                       reverse=True)
+                    top5 = [p for p in ordenados if p["prob"] >= PROB_MIN][:5]
+                    if not top5:
+                        st.caption("Sin picks que cumplan filtros")
+                    for j, p in enumerate(top5):
+                        with st.container(border=True):
+                            st.write(f"**{p['market']}** — {p['selection']}")
+                            x1, x2, x3 = st.columns(3)
+                            x1.metric("Prob", f"{p['prob']}%")
+                            x2.metric("Justa", f"{p['fair_odd']:.2f}")
+                            cr = p.get("cuota_real")
+                            if cr:
+                                edge = p.get("edge_%", 0)
+                                x3.metric("Real", f"{cr:.2f}", delta=f"{edge:+.1f}%")
+                            else:
+                                x3.metric("Real", "—")
+                            if cr and p.get("edge_%", 0) > 5:
+                                st.success(f"✅ VALUE: +{p['edge_%']:.1f}%")
+                            if st.button("➕ Boleto", key=f"a_{a['partido']}_{j}"):
+                                st.session_state.boleto.append({
+                                    "partido": a["partido"],
+                                    "seleccion": p["selection"],
+                                    "cuota": cr if cr else p["fair_odd"],
+                                })
+                                st.toast(f"Añadido: {p['selection']}")
+                with c2:
+                    st.markdown("#### 🧠 IA")
+                    ia = a.get("ia")
+                    if not ia:
+                        st.caption("Sin IA (configura GROQ_API_KEY)")
+                    else:
+                        st.info(ia.get("analisis", ""))
+                        st.write(f"**Pick:** {ia.get('pick_recomendado', '-')}")
+                        st.write(f"**Confianza:** {ia.get('confianza', 0)}/10")
+                        if ia.get("riesgos"):
+                            st.warning("⚠️ " + " · ".join(ia["riesgos"]))
+
+
+with t2:
+    st.subheader("🧾 Boleto")
+    if not st.session_state.boleto:
+        st.info("Vacío")
+    else:
+        ct = 1.0
+        for b in st.session_state.boleto:
+            ct *= b["cuota"]
+        c1, c2 = st.columns(2)
+        c1.metric("Selecciones", len(st.session_state.boleto))
+        c2.metric("Cuota", f"{ct:.2f}")
+        for i, b in enumerate(st.session_state.boleto, 1):
+            st.write(f"**{i}.** {b['seleccion']} — _{b['partido']}_ @{b['cuota']:.2f}")
+        stake = st.number_input("Stake", 1.0, value=10.0, step=1.0)
+        st.success(f"💰 Ganancia: **{stake * ct:.2f}**")
+        if st.button("📲 Telegram"):
+            msg = "🎯 *BOLETO*\n\n"
+            for i, b in enumerate(st.session_state.boleto, 1):
+                msg += f"{i}. {b['seleccion']} · @{b['cuota']:.2f}\n"
+            msg += f"\nCuota: *{ct:.2f}* | Ganancia: {stake * ct:.2f}"
+            st.success("✅ Enviado") if tg_send(msg) else st.warning("⚠️ Falló")
+
+
+with t3:
+    st.subheader("📚 Historial")
+    rend = stats_rendimiento()
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("✅ Ganados", rend["ganados"])
+    c2.metric("❌ Perdidos", rend["perdidos"])
+    c3.metric("⭕ Anulados", rend["anulados"])
+    c4.metric("🎯 Hit rate", f"{rend['hit_rate']}%")
+    if rend["por_mercado"]:
+        with st.expander("📊 Rendimiento por mercado"):
+            for m in rend["por_mercado"]:
+                st.write(f"**{m['mercado']}** — ✅ {m['ganados']} · ❌ {m['perdidos']} "
+                         f"· ⭕ {m['anulados']} → Hit **{m['hit']}%**")
+    st.divider()
+    filtro = st.radio("Filtrar:",
+                      ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
+                      horizontal=True)
+    estado = None if filtro == "Todos" else filtro
+    picks = listar_picks(estado=estado)
+    if not picks:
+        st.info(f"No hay picks con estado **{filtro}**")
+    else:
+        st.caption(f"Mostrando {len(picks)} picks")
+        for p in picks:
+            pid = p["id"]
+            with st.container(border=True):
+                col_info, col_acc = st.columns([3, 2])
+                with col_info:
+                    st.write(f"**{p['home']} vs {p['away']}**")
+                    st.caption(f"🕐 {p['fecha_partido']} · {p.get('liga','')}")
+                    st.write(f"🎯 {p['mercado']}: **{p['seleccion']}**")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
+                    c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
+                    c3.metric("C. real",
+                              f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
+                    est = p["estado"]
+                    if est == "GANADO": st.success("✅ GANADO")
+                    elif est == "PERDIDO": st.error("❌ PERDIDO")
+                    elif est == "ANULADO": st.info("⭕ ANULADO")
+                    else: st.warning("⏳ PENDIENTE")
+                with col_acc:
+                    st.write("**Cambiar estado:**")
+                    b1, b2, b3 = st.columns(3)
+                    with b1:
+                        if st.button("✅", key=f"g_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "GANADO")
+                            st.rerun()
+                    with b2:
+                        if st.button("❌", key=f"p_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "PERDIDO")
+                            st.rerun()
+                    with b3:
+                        if st.button("⭕", key=f"a_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "ANULADO")
+                            st.rerun()
+                    if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
+                        eliminar_pick(pid)
+                        st.rerun()
