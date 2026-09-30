@@ -313,7 +313,7 @@ def get_odds_oddsapi(match):
         if d["Over"]: out["Goles totales"]["+" + pt] = avg(d["Over"])
         if d["Under"]: out["Goles totales"]["-" + pt] = avg(d["Under"])
     return {k: v for k, v in out.items() if v}
-
+    
 
 def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
@@ -540,7 +540,7 @@ with t1:
                     st.markdown("#### 📈 Picks del modelo")
                     candidatos = [p for p in a["picks"]
                                   if PROB_MIN <= p["prob"] <= PROB_MAX
-                                                            and p["fair_odd"] >= CUOTA_MIN]
+                                  and p["fair_odd"] >= CUOTA_MIN]
                     top5 = sorted(candidatos,
                                   key=lambda x: (x.get("edge_%") or -999, x["prob"]),
                                   reverse=True)[:5]
@@ -583,7 +583,8 @@ with t1:
 
 with t2:
     st.subheader("🔺 Reto Escalera")
-    st.caption("Encadena apuestas con cuota fija (~1.40) reinvirtiendo el capital.")
+    st.caption("Encadena apuestas con cuota fija (~1.40) sin repetir partido "
+               "ni solapar horarios.")
     c1, c2, c3 = st.columns(3)
     with c1:
         stake_inicial = st.number_input("Stake inicial ($)", min_value=1.0,
@@ -612,25 +613,35 @@ with t2:
     st.divider()
     st.markdown("### 🎯 Picks candidatos para la escalera")
     tolerancia = st.slider("Tolerancia en la cuota (±)", 0.02, 0.20, 0.10, 0.01)
-    candidatos_esc = []
+
+    # 1 pick por partido (el más cercano a la cuota objetivo)
+    mejor_por_partido = {}
     for a in st.session_state.analisis:
         for p in a["picks"]:
             cuota_ref = p.get("cuota_real") or p["fair_odd"]
             if abs(cuota_ref - cuota_escalera) <= tolerancia and p["prob"] >= 55.0:
-                candidatos_esc.append({
-                    **p,
-                    "partido": a["partido"],
-                    "fecha": a["fecha"],
-                    "cuota_ref": cuota_ref,
-                    "distancia": abs(cuota_ref - cuota_escalera),
-                })
-    candidatos_esc.sort(key=lambda x: x["distancia"])
+                dist = abs(cuota_ref - cuota_escalera)
+                key = a["partido"]
+                if key not in mejor_por_partido or dist < mejor_por_partido[key]["distancia"]:
+                    mejor_por_partido[key] = {
+                        **p,
+                        "partido": a["partido"],
+                        "fecha": a["fecha"],
+                        "cuota_ref": cuota_ref,
+                        "distancia": dist,
+                    }
+
+    # Ordenar cronológicamente por hora de kickoff
+    candidatos_esc = list(mejor_por_partido.values())
+    candidatos_esc.sort(key=lambda x: x["fecha"])
+
     if not candidatos_esc:
         st.info(f"👈 Analiza partidos primero. Buscando picks con cuota "
                 f"entre **{cuota_escalera - tolerancia:.2f}** y "
                 f"**{cuota_escalera + tolerancia:.2f}**.")
     else:
-        st.caption(f"Encontrados **{len(candidatos_esc)}** picks que encajan")
+        st.caption(f"Encontrados **{len(candidatos_esc)}** partidos candidatos "
+                   f"(1 pick por partido, ordenados por hora)")
         for i, p in enumerate(candidatos_esc[:20]):
             with st.container(border=True):
                 col1, col2, col3 = st.columns([3, 2, 1])
@@ -661,11 +672,27 @@ with t2:
     st.divider()
     st.markdown("### 🧮 Simulador con tus picks")
     if st.button("🎲 Simular escalera con los mejores picks", type="primary"):
-        if len(candidatos_esc) < n_pasos:
-            st.warning(f"Necesitas al menos {n_pasos} picks. "
-                       f"Solo tienes {len(candidatos_esc)}.")
-        else:
-            seleccionados = candidatos_esc[:n_pasos]
+        # Filtrar: sin solapamiento horario (2h por partido)
+        seleccionados = []
+        ultima_hora_fin = None
+        for p in candidatos_esc:
+            try:
+                hora_inicio = datetime.fromisoformat(p["fecha"].replace(" ", "T"))
+            except Exception:
+                continue
+            if ultima_hora_fin is not None and hora_inicio < ultima_hora_fin:
+                continue
+            seleccionados.append(p)
+            ultima_hora_fin = hora_inicio + timedelta(hours=2)
+            if len(seleccionados) >= n_pasos:
+                break
+
+        if len(seleccionados) < n_pasos:
+            st.warning(f"Solo se encontraron **{len(seleccionados)}** partidos "
+                       f"que no se solapan en horario (necesitas {n_pasos}). "
+                       f"Analiza más partidos o cambia de liga.")
+
+        if seleccionados:
             simulacion = []
             capital = stake_inicial
             for i, p in enumerate(seleccionados, 1):
@@ -675,20 +702,21 @@ with t2:
                     "Paso": i,
                     "Pick": p["selection"],
                     "Partido": p["partido"],
+                    "Hora": p["fecha"][11:16],
                     "Cuota": round(cuota_paso, 2),
                     "Capital antes": round(capital, 2),
                     "Capital después": round(capital_despues, 2),
                 })
                 capital = capital_despues
             st.dataframe(simulacion, use_container_width=True, hide_index=True)
-            st.success(f"💰 Si aciertas los {n_pasos} pasos: "
+            st.success(f"💰 Si aciertas los {len(seleccionados)} pasos: "
                        f"**${capital:.2f}** (x{capital/stake_inicial:.1f})")
             if st.button("📲 Enviar escalera a Telegram"):
                 msg = f"🔺 *RETO ESCALERA*\n\n"
-                msg += f"Stake: ${stake_inicial:.2f} | Pasos: {n_pasos}\n"
+                msg += f"Stake: ${stake_inicial:.2f} | Pasos: {len(seleccionados)}\n"
                 msg += f"Cuota objetivo: {cuota_escalera}\n\n"
                 for s in simulacion:
-                    msg += (f"*Paso {s['Paso']}*: {s['Pick']}\n"
+                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}): {s['Pick']}\n"
                             f"  _{s['Partido']}_\n"
                             f"  @{s['Cuota']} → ${s['Capital después']:.2f}\n\n")
                 msg += f"💰 Final: *${capital:.2f}*\n_LuciSport AI_"
@@ -733,44 +761,44 @@ with t4:
                          f"· ⭕ {m['anulados']} → Hit **{m['hit']}%**")
     st.divider()
     filtro = st.radio("Filtrar:",
-                      ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
-                      horizontal=True)
-    estado = None if filtro == "Todos" else filtro
-    picks = listar_picks(estado=estado)
-    if not picks:
-        st.info(f"No hay picks con estado **{filtro}**")
-    else:
-        st.caption(f"Mostrando {len(picks)} picks")
-        for p in picks:
-            pid = p["id"]
-            with st.container(border=True):
-                col_info, col_acc = st.columns([3, 2])
-                with col_info:
-                    st.write(f"**{p['home']} vs {p['away']}**")
-                    st.caption(f"🕐 {p['fecha_partido']} · {p.get('liga','')}")
-                    st.write(f"🎯 {p['mercado']}: **{p['seleccion']}**")
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
-                    c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
-                    c3.metric("C. real",
-                              f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
-                    est = p["estado"]
-                    st.success("✅ GANADO") if est == "GANADO" else (st.error("❌ PERDIDO") if est == "PERDIDO" else (st.info("⭕ ANULADO") if est == "ANULADO" else st.warning("⏳ PENDIENTE")))
-                with col_acc:
-                    st.write("**Cambiar estado:**")
-                    b1, b2, b3 = st.columns(3)
-                    with b1:
-                        if st.button("✅", key=f"g_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "GANADO")
-                            st.rerun()
-                    with b2:
-                        if st.button("❌", key=f"p_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "PERDIDO")
-                            st.rerun()
-                    with b3:
-                        if st.button("⭕", key=f"a_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "ANULADO")
-                            st.rerun()
-                    if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
-                        eliminar_pick(pid)
+                  ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
+                  horizontal=True)
+estado = None if filtro == "Todos" else filtro
+picks = listar_picks(estado=estado)
+if not picks:
+    st.info(f"No hay picks con estado **{filtro}**")
+else:
+    st.caption(f"Mostrando {len(picks)} picks")
+    for p in picks:
+        pid = p["id"]
+        with st.container(border=True):
+            col_info, col_acc = st.columns([3, 2])
+            with col_info:
+                st.write(f"**{p['home']} vs {p['away']}**")
+                st.caption(f"🕐 {p['fecha_partido']} · {p.get('liga','')}")
+                st.write(f"🎯 {p['mercado']}: **{p['seleccion']}**")
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
+                c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
+                c3.metric("C. real",
+                          f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
+                est = p["estado"]
+                st.success("✅ GANADO") if est == "GANADO" else (st.error("❌ PERDIDO") if est == "PERDIDO" else (st.info("⭕ ANULADO") if est == "ANULADO" else st.warning("⏳ PENDIENTE")))
+            with col_acc:
+                st.write("**Cambiar estado:**")
+                b1, b2, b3 = st.columns(3)
+                with b1:
+                    if st.button("✅", key=f"g_{pid}", use_container_width=True):
+                        cambiar_estado(pid, "GANADO")
                         st.rerun()
+                with b2:
+                    if st.button("❌", key=f"p_{pid}", use_container_width=True):
+                        cambiar_estado(pid, "PERDIDO")
+                        st.rerun()
+                with b3:
+                    if st.button("⭕", key=f"a_{pid}", use_container_width=True):
+                        cambiar_estado(pid, "ANULADO")
+                        st.rerun()
+                if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
+                    eliminar_pick(pid)
+                    st.rerun()
