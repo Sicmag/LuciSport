@@ -783,7 +783,14 @@ else:
                 c3.metric("C. real",
                           f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
                 est = p["estado"]
-                st.success("✅ GANADO") if est == "GANADO" else (st.error("❌ PERDIDO") if est == "PERDIDO" else (st.info("⭕ ANULADO") if est == "ANULADO" else st.warning("⏳ PENDIENTE")))
+                if est == "GANADO":
+    st.success("✅ GANADO")
+elif est == "PERDIDO":
+    st.error("❌ PERDIDO")
+elif est == "ANULADO":
+    st.info("⭕ ANULADO")
+else:
+    st.warning("⏳ PENDIENTE")
             with col_acc:
                 st.write("**Cambiar estado:**")
                 b1, b2, b3 = st.columns(3)
