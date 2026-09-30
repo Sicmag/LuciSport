@@ -1,8 +1,7 @@
-"""LuciSport AI — versión completa con verificación de value."""
+"""LuciSport AI — versión simplificada."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
-from streamlit_autorefresh import st_autorefresh
 
 
 # ============================================================
@@ -32,7 +31,6 @@ GROQ_KEY = _get("GROQ_API_KEY", "")
 HEADERS = {'X-Auth-Token': FOOTBALL_KEY}
 
 PROB_MIN, CUOTA_MIN = 55.0, 1.50
-MAX_PICKS, BANKROLL = 5, 100000
 LINEAS = [0.5, 1.5, 2.5, 3.5, 4.5]
 
 SPORT_KEYS = {"PL": "soccer_epl", "PD": "soccer_spain_la_liga",
@@ -137,34 +135,8 @@ def stats_rendimiento():
     anulados = sum(1 for r in rows if r["estado"] == "ANULADO")
     tot = ganados + perdidos
     hit = round(ganados / tot * 100, 1) if tot else 0
-
-    mercados = {}
-    for r in rows:
-        if r["estado"] not in ("GANADO", "PERDIDO", "ANULADO"):
-            continue
-        m = r["mercado"]
-        mercados.setdefault(m, {"ganados": 0, "perdidos": 0, "anulados": 0})
-        if r["estado"] == "GANADO":
-            mercados[m]["ganados"] += 1
-        elif r["estado"] == "PERDIDO":
-            mercados[m]["perdidos"] += 1
-        else:
-            mercados[m]["anulados"] += 1
-
-    por_mercado = []
-    for m, d in mercados.items():
-        tot_m = d["ganados"] + d["perdidos"]
-        por_mercado.append({
-            "mercado": m,
-            "ganados": d["ganados"], "perdidos": d["perdidos"],
-            "anulados": d["anulados"],
-            "hit": round(d["ganados"] / tot_m * 100, 1) if tot_m else 0,
-        })
-
-    return {
-        "ganados": ganados, "perdidos": perdidos, "anulados": anulados,
-        "hit_rate": hit, "por_mercado": por_mercado,
-    }
+    return {"ganados": ganados, "perdidos": perdidos,
+            "anulados": anulados, "hit_rate": hit}
 
 
 # ============================================================
@@ -201,7 +173,7 @@ def over_under(lam, linea):
     return round(100 - p_under), round(p_under)
 
 
-def kelly(prob, odd, bank=BANKROLL):
+def kelly(prob, odd, bank=100000):
     p, b = prob / 100.0, odd - 1
     if b <= 0: return 0.0
     f = (p * b - (1 - p)) / b
@@ -331,7 +303,6 @@ def get_odds_oddsapi(match):
 #  MOTOR DE ANÁLISIS
 # ============================================================
 def analizar(match, liga_codigo):
-    """Devuelve TODOS los picks, sin filtrar. La UI decide qué mostrar."""
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     hs = get_team_data(match['homeTeam']['id'])
     as_ = get_team_data(match['awayTeam']['id'])
@@ -383,7 +354,6 @@ def analizar(match, liga_codigo):
     except Exception:
         pass
 
-    # Stake sugerido para todos
     for p in picks:
         p["stake_sug"] = kelly(p["prob"], p["fair_odd"])
 
@@ -395,7 +365,6 @@ def ia_analizar(match, picks):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     sys_prompt = """Analista de apuestas. Devuelve JSON:
 {"analisis":"3 frases","pick_recomendado":"x","confianza":7,"riesgos":["r1"]}"""
-    # Solo los mejores para la IA
     con_edge = [p for p in picks if p.get("edge_%", 0) > 3][:5]
     if not con_edge:
         con_edge = sorted(picks, key=lambda x: x["prob"], reverse=True)[:5]
@@ -461,11 +430,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("⚙️ Filtros")
-    edge_min = st.slider("Edge mínimo (%)", 0.0, 15.0, 4.0, 0.5,
-                         help="Umbral para considerar 'value bet'")
     prob_min = st.slider("Prob mínima (%)", 50.0, 85.0, 55.0, 1.0)
-    solo_cuota_real = st.checkbox("Solo con cuota real", value=False,
-                                  help="Oculta las líneas sin cuota de casas")
+    edge_min = st.slider("Edge mínimo (%)", 0.0, 15.0, 4.0, 0.5)
 
     st.divider()
     if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
@@ -481,23 +447,6 @@ with st.sidebar:
         f"{s.get('GANADO', 0)} gan · {s.get('PERDIDO', 0)} per · "
         f"{s.get('ANULADO', 0)} anul"
     )
-
-    with st.expander("🔬 Debug APIs"):
-        st.caption(f"Supabase: `{_limpiar_url(_get('SUPABASE_URL',''))[:35]}...`")
-        st.caption(f"Odds API: {len(ODDS_KEYS)} keys")
-        st.caption(f"Groq: {'✅' if GROQ_KEY else '❌'}")
-
-    st.divider()
-    st.subheader("🔄 Actualización")
-    refresh_seg = st.selectbox(
-        "Auto-refresh",
-        [0, 30, 60, 300, 600],
-        format_func=lambda x: "Desactivado" if x == 0 else f"Cada {x}s",
-        index=0,
-    )
-    if refresh_seg > 0:
-        st_autorefresh(interval=refresh_seg * 1000, key="auto_refresh")
-        st.caption("✅ Recarga automática activa")
 
     st.divider()
     st.subheader("🧾 Boleto")
@@ -523,18 +472,12 @@ with st.sidebar:
 
 
 # ============================================================
-#  HEADER
+#  HEADER + TABS
 # ============================================================
 st.title("⚽ LuciSport AI")
 st.caption("Dixon-Coles + Groq + Odds API + Supabase")
 
-t1, t2, t3, t4, t5 = st.tabs([
-    "📅 Partidos",
-    "📊 Por Mercados",
-    "🔗 Combinadas",
-    "🧾 Boleto",
-    "📚 Historial",
-])
+t1, t2, t3 = st.tabs(["📅 Partidos", "🧾 Boleto", "📚 Historial"])
 
 
 # ============================================================
@@ -563,4 +506,43 @@ with t1:
                 res = []
                 for s in sel:
                     m = st.session_state.partidos[ops[s]]
-           
+                    with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
+                        try:
+                            picks = analizar(m, liga_codigo)
+                            # Guardar solo los mejores en BD
+                            top = [p for p in picks
+                                   if p.get("edge_%", 0) > 3 and p["prob"] >= PROB_MIN][:5]
+                            for p in top:
+                                guardar_pick(m, p)
+                            ia = ia_analizar(m, picks) if usar_ia else None
+                            res.append({
+                                "partido": f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}",
+                                "fecha": (m.get('utcDate') or '')[:16],
+                                "picks": picks,
+                                "ia": ia,
+                                "error": None,
+                            })
+                        except Exception as e:
+                            import traceback
+                            res.append({
+                                "partido": f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}",
+                                "fecha": "",
+                                "picks": [],
+                                "ia": None,
+                                "error": f"{type(e).__name__}: {e}",
+                                "traceback": traceback.format_exc(),
+                            })
+                st.session_state.analisis = res
+                st.success(f"✅ {len(res)} partidos analizados")
+                st.rerun()
+
+        # Filtro de valor
+        filtro_valor = st.checkbox(
+            "🎯 Mostrar solo picks con edge > 0%", value=False,
+        ) if st.session_state.analisis else False
+
+        for a in st.session_state.analisis:
+            if a.get("error"):
+                st.error(f"❌ {a['partido']}: {a['error']}")
+                with st.expander("Traceback"):
+                
