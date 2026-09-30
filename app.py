@@ -313,7 +313,7 @@ def get_odds_oddsapi(match):
         if d["Over"]: out["Goles totales"]["+" + pt] = avg(d["Over"])
         if d["Under"]: out["Goles totales"]["-" + pt] = avg(d["Under"])
     return {k: v for k, v in out.items() if v}
-    
+
 
 def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
@@ -540,7 +540,7 @@ with t1:
                     st.markdown("#### 📈 Picks del modelo")
                     candidatos = [p for p in a["picks"]
                                   if PROB_MIN <= p["prob"] <= PROB_MAX
-                                  and p["fair_odd"] >= CUOTA_MIN]
+                                                            and p["fair_odd"] >= CUOTA_MIN]
                     top5 = sorted(candidatos,
                                   key=lambda x: (x.get("edge_%") or -999, x["prob"]),
                                   reverse=True)[:5]
@@ -755,10 +755,7 @@ with t4:
                     c3.metric("C. real",
                               f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
                     est = p["estado"]
-                    if est == "GANADO": st.success("✅ GANADO")
-                    elif est == "PERDIDO": st.error("❌ PERDIDO")
-             elif est == "ANULADO": st.info("⭕ ANULADO")
-                    else: st.warning("⏳ PENDIENTE")
+                    st.success("✅ GANADO") if est == "GANADO" else (st.error("❌ PERDIDO") if est == "PERDIDO" else (st.info("⭕ ANULADO") if est == "ANULADO" else st.warning("⏳ PENDIENTE")))
                 with col_acc:
                     st.write("**Cambiar estado:**")
                     b1, b2, b3 = st.columns(3)
