@@ -764,38 +764,38 @@ with t4:
     if not picks:
         st.info(f"No hay picks con estado **{filtro}**")
     else:
-    st.caption(f"Mostrando {len(picks)} picks")
-for p in picks:
-    pid = p["id"]
-    with st.container(border=True):
-        col_info, col_acc = st.columns([3, 2])
-        with col_info:
-            st.write(f"**{p['home']} vs {p['away']}**")
-            st.caption(f"🕐 {p['fecha_partido']} · {p.get('liga','')}")
-            st.write(f"🎯 {p['mercado']}: **{p['seleccion']}**")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
-            c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
-            c3.metric("C. real",
-                      f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
-            est = p["estado"]
-            iconos = {"GANADO": "✅", "PERDIDO": "❌", "ANULADO": "⭕"}
-            st.write(f"{iconos.get(est, '⏳')} **{est}**")
-        with col_acc:
-            st.write("**Cambiar estado:**")
-            b1, b2, b3 = st.columns(3)
-            with b1:
-                if st.button("✅", key=f"g_{pid}", use_container_width=True):
-                    cambiar_estado(pid, "GANADO")
-                    st.rerun()
-            with b2:
-                if st.button("❌", key=f"p_{pid}", use_container_width=True):
-                    cambiar_estado(pid, "PERDIDO")
-                    st.rerun()
-            with b3:
-                if st.button("⭕", key=f"a_{pid}", use_container_width=True):
-                    cambiar_estado(pid, "ANULADO")
-                    st.rerun()
-            if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
-                eliminar_pick(pid)
-                st.rerun()
+        st.caption(f"Mostrando {len(picks)} picks")
+        for p in picks:
+            pid = p["id"]
+            with st.container(border=True):
+                col_info, col_acc = st.columns([3, 2])
+                with col_info:
+                    st.write(f"**{p['home']} vs {p['away']}**")
+                    st.caption(f"🕐 {p['fecha_partido']} · {p.get('liga','')}")
+                    st.write(f"🎯 {p['mercado']}: **{p['seleccion']}**")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
+                    c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
+                    c3.metric("C. real",
+                              f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
+                    est = p["estado"]
+                    iconos = {"GANADO": "✅", "PERDIDO": "❌", "ANULADO": "⭕"}
+                    st.write(f"{iconos.get(est, '⏳')} **{est}**")
+                with col_acc:
+                    st.write("**Cambiar estado:**")
+                    b1, b2, b3 = st.columns(3)
+                    with b1:
+                        if st.button("✅", key=f"g_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "GANADO")
+                            st.rerun()
+                    with b2:
+                        if st.button("❌", key=f"p_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "PERDIDO")
+                            st.rerun()
+                    with b3:
+                        if st.button("⭕", key=f"a_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "ANULADO")
+                            st.rerun()
+                    if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
+                        eliminar_pick(pid)
+                        st.rerun()
