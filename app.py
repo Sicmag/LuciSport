@@ -1,4 +1,4 @@
-"""LuciSport AI — Fase 1 con escaleras guardadas."""
+"""LuciSport AI — Fase 1 con escaleras guardadas + fix mercado."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
@@ -173,7 +173,7 @@ def guardar_escalera(nombre, liga, cuota_obj, stake_ini, n_pasos, pasos, capital
             "capital_final": capital_final,
             "estado": "ACTIVA",
         }
-        r = get_supabase().table("escaleras").insert(fila).execute()
+        get_supabase().table("escaleras").insert(fila).execute()
         return True
     except Exception as e:
         st.error(f"Error guardando escalera: {e}")
@@ -349,6 +349,7 @@ def get_odds_oddsapi(match):
         if d["Under"]: out["Goles totales"]["-" + pt] = avg(d["Under"])
     return {k: v for k, v in out.items() if v}
     
+
 
 def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
@@ -599,7 +600,7 @@ with t1:
                             if st.button("➕ Boleto", key=f"a_{a['partido']}_{j}"):
                                 st.session_state.boleto.append({
                                     "partido": a["partido"],
-                                    "seleccion": p["selection"],
+                                    "seleccion": f"[{p['market']}] {p['selection']}",
                                     "cuota": cr if cr else p["fair_odd"],
                                 })
                                 st.toast(f"Añadido: {p['selection']}")
@@ -649,7 +650,6 @@ with t2:
 
     st.divider()
 
-    # Buscar candidatos (silencioso)
     tolerancia = st.slider("Tolerancia en la cuota (±)", 0.02, 0.20, 0.10, 0.01)
 
     mejor_por_partido = {}
@@ -671,12 +671,11 @@ with t2:
     candidatos_esc = list(mejor_por_partido.values())
     candidatos_esc.sort(key=lambda x: x["fecha"])
 
-    # Mostrar candidatos en expander (oculto por defecto)
     if candidatos_esc:
         with st.expander(f"🔍 Ver {len(candidatos_esc)} candidatos (oculto por defecto)",
                          expanded=False):
             for i, p in enumerate(candidatos_esc[:20]):
-                st.write(f"• **{p['selection']}** — {p['partido']} "
+                st.write(f"• **[{p['market']}] {p['selection']}** — {p['partido']} "
                          f"({p['fecha'][11:16]}) @{p['cuota_ref']:.2f} "
                          f"[{p['prob']}%]")
     else:
@@ -712,6 +711,7 @@ with t2:
                 capital_despues = capital * cuota_paso
                 simulacion.append({
                     "Paso": i,
+                    "Mercado": p["market"],
                     "Pick": p["selection"],
                     "Partido": p["partido"],
                     "Hora": p["fecha"][11:16],
@@ -725,7 +725,6 @@ with t2:
             st.success(f"💰 Si aciertas los {len(seleccionados)} pasos: "
                        f"**${capital:.2f}** (x{capital/stake_inicial:.1f})")
 
-            # Guardar en session_state
             st.session_state["ultima_simulacion"] = {
                 "seleccionados": seleccionados,
                 "simulacion": simulacion,
@@ -736,7 +735,6 @@ with t2:
                 "liga": liga_codigo,
             }
 
-    # Botones post-simulación
     sim = st.session_state.get("ultima_simulacion")
     if sim:
         st.divider()
@@ -770,7 +768,8 @@ with t2:
                 msg += f"Stake: ${sim['stake_inicial']:.2f} | Pasos: {sim['n_pasos']}\n"
                 msg += f"Cuota objetivo: {sim['cuota_escalera']}\n\n"
                 for s in sim["simulacion"]:
-                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}): {s['Pick']}\n"
+                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}): "
+                            f"[{s['Mercado']}] {s['Pick']}\n"
                             f"  _{s['Partido']}_\n"
                             f"  @{s['Cuota']} → ${s['Capital después']:.2f}\n\n")
                 msg += f"💰 Final: *${sim['capital_final']:.2f}*\n_LuciSport AI_"
@@ -780,7 +779,7 @@ with t2:
                 for p in sim["seleccionados"]:
                     st.session_state.boleto.append({
                         "partido": p["partido"],
-                        "seleccion": f"[ESC] {p['selection']}",
+                        "seleccion": f"[{p['market']}] {p['selection']}",
                         "cuota": p["cuota_ref"],
                     })
                 st.success(f"✅ {len(sim['seleccionados'])} picks añadidos")
@@ -820,8 +819,10 @@ with t3:
                 with st.expander("Ver pasos"):
                     pasos = esc.get("pasos", [])
                     for p in pasos:
+                        mercado = p.get('Mercado') or p.get('market') or "—"
                         st.write(f"**Paso {p.get('Paso', '?')}** "
-                                 f"({p.get('Hora', '?')}): {p.get('Pick', '?')}")
+                                 f"({p.get('Hora', '?')})")
+                        st.write(f"[{mercado}] {p.get('Pick', p.get('selection', '?'))}")
                         st.caption(f"{p.get('Partido', '?')} — "
                                    f"@{p.get('Cuota', 0)} → "
                                    f"${p.get('Capital después', 0):.2f}")
@@ -907,3 +908,4 @@ with t5:
                     if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
                         eliminar_pick(pid)
                         st.rerun()
+
