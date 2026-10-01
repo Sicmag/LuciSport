@@ -1,12 +1,9 @@
-"""LuciSport AI — con Login y IA."""
+"""LuciSport AI — versión completa con Login + Gemini."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
 
 
-# ============================================================
-#  CONFIGURACIÓN
-# ============================================================
 def _get(key, default=""):
     try:
         if key in st.secrets:
@@ -27,6 +24,7 @@ TELEGRAM_TOKEN = _get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = _get("TELEGRAM_CHAT_ID")
 ODDS_KEYS = [k.strip() for k in _get("ODDS_API_KEYS", "").split(",") if k.strip()]
 GROQ_KEY = _get("GROQ_API_KEY", "")
+GEMINI_KEY = _get("GEMINI_API_KEY", "")
 SUPABASE_URL = _get("SUPABASE_URL", "")
 SUPABASE_KEY = _get("SUPABASE_KEY", "")
 
@@ -74,7 +72,7 @@ def login_usuario(email, password):
         r = get_supabase().auth.sign_in_with_password({"email": email, "password": password})
         return r.user
     except Exception as e:
-        return None
+        return str(e)
 
 
 def registrar_usuario(email, password):
@@ -97,7 +95,7 @@ def cerrar_sesion():
 
 
 # ============================================================
-#  BASE DE DATOS (filtrada por usuario)
+#  BASE DE DATOS
 # ============================================================
 def guardar_pick(match, pick, user_id, estado="PENDIENTE", es_value=False):
     match_id = f"{match['homeTeam']['id']}_{match['awayTeam']['id']}_{(match.get('utcDate') or '')[:16]}"
@@ -504,14 +502,11 @@ def analizar(match, liga_codigo):
 
 
 # ============================================================
-#  IA AVANZADA
+#  IA CON GEMINI
 # ============================================================
 def ia_analizar_completo(match, picks, cuotas_reales=None):
-    """
-    Análisis avanzado con IA. Recibe partido + picks + cuotas.
-    Devuelve análisis enriquecido.
-    """
-    if not GROQ_KEY:
+    """Análisis avanzado con IA usando Google Gemini."""
+    if not GEMINI_KEY:
         return None
     h = match['homeTeam']['name']
     a = match['awayTeam']['name']
@@ -540,7 +535,6 @@ FORMATO DE RESPUESTA (JSON estricto):
   "resumen": "una frase final con la recomendación principal"
 }"""
 
-    # Preparar los picks para la IA (los más relevantes)
     picks_ordenados = sorted(
         picks,
         key=lambda x: (x.get("edge_%") or -999, x["prob"]),
@@ -565,25 +559,30 @@ FECHA: {fecha}
     txt += "\nGenera el análisis en el formato JSON especificado."
 
     try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}",
-                     "Content-Type": "application/json"},
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": txt},
-                ],
-                "temperature": 0.3,
-                "max_tokens": 800,
-                "response_format": {"type": "json_object"},
+        url = (f"https://generativelanguage.googleapis.com/v1beta/"
+               f"models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}")
+        payload = {
+            "system_instruction": {
+                "parts": [{"text": sys_prompt}]
             },
-            timeout=30)
+            "contents": [
+                {"role": "user", "parts": [{"text": txt}]}
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 800,
+                "responseMimeType": "application/json"
+            }
+        }
+        r = requests.post(url, json=payload, timeout=30)
         if r.status_code == 200:
-            return json.loads(r.json()["choices"][0]["message"]["content"])
+            data = r.json()
+            texto = data["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(texto)
+        else:
+            st.warning(f"Error Gemini: {r.status_code} - {r.text[:200]}")
     except Exception as e:
-        pass
+        st.warning(f"Error llamando a Gemini: {e}")
     return None
 
 
@@ -600,14 +599,14 @@ def tg_send(msg):
 
 
 # ============================================================
-#  UI — CONFIGURACIÓN DE PÁGINA
+#  UI
 # ============================================================
 st.set_page_config(page_title="LuciSport AI", page_icon="⚽", layout="wide",
                    initial_sidebar_state="collapsed")
 
 
 # ============================================================
-#  PANTALLA DE LOGIN
+#  LOGIN
 # ============================================================
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -630,16 +629,14 @@ if st.session_state.user is None:
                     st.error("Completa email y contraseña")
                 else:
                     user = login_usuario(email, password)
-                    if user:
-                        st.session_state.user = {
-                            "id": user.id,
-                            "email": user.email,
-                        }
+                    if user and not isinstance(user, str):
+                        st.session_state.user = {"id": user.id, "email": user.email}
                         st.session_state.analisis_cargado = False
                         st.success(f"Bienvenido {user.email}")
                         st.rerun()
                     else:
-                        st.error("Email o contraseña incorrectos")
+                        msg = user if isinstance(user, str) else "Email o contraseña incorrectos"
+                        st.error(f"Error: {msg}")
 
     with tab_registro:
         with st.form("form_registro"):
@@ -659,14 +656,15 @@ if st.session_state.user is None:
                 else:
                     user = registrar_usuario(email_r, password_r)
                     if user:
-                        st.success("Cuenta creada. Inicia sesión.")
+                        st.success("✅ Cuenta creada. Revisa tu email para confirmar, "
+                                   "luego inicia sesión.")
                     else:
                         st.error("No se pudo crear la cuenta")
     st.stop()
 
 
 # ============================================================
-#  USUARIO AUTENTICADO
+#  APP AUTENTICADA
 # ============================================================
 USER_ID = st.session_state.user["id"]
 USER_EMAIL = st.session_state.user["email"]
@@ -683,7 +681,6 @@ if "usar_ia" not in st.session_state:
     st.session_state.usar_ia = True
 
 
-# Recuperar análisis
 if not st.session_state.analisis_cargado:
     with st.spinner("Recuperando análisis guardados..."):
         recuperados = reconstruir_analisis_desde_bd(USER_ID)
@@ -707,7 +704,7 @@ with st.sidebar:
     liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
     liga_codigo = LIGAS[liga_nombre]
     dias = st.slider("Días a futuro", 1, 14, 5)
-    usar_ia = st.toggle("IA (Groq)", value=st.session_state.usar_ia)
+    usar_ia = st.toggle("IA (Gemini)", value=st.session_state.usar_ia)
     st.session_state.usar_ia = usar_ia
     max_p = st.slider("Máx. partidos", 1, 10, 5)
     st.divider()
@@ -730,7 +727,13 @@ with st.sidebar:
         f"{s.get('GANADO', 0)} gan · {s.get('PERDIDO', 0)} per · "
         f"{s.get('ANULADO', 0)} anul"
     )
-    st.caption(f"🧠 Análisis en memoria: **{len(st.session_state.analisis)}** partidos")
+    st.caption(f"🧠 Análisis: **{len(st.session_state.analisis)}** partidos")
+
+    with st.expander("🔬 Debug APIs"):
+        st.caption(f"Supabase: `{_limpiar_url(SUPABASE_URL)[:35]}...`")
+        st.caption(f"Odds API: {len(ODDS_KEYS)} keys")
+        st.caption(f"Gemini: {'✅' if GEMINI_KEY else '❌'}")
+        st.caption(f"Groq: {'✅' if GROQ_KEY else '❌ (no usado)'}")
 
     st.divider()
     st.subheader("🧾 Boleto")
@@ -756,10 +759,10 @@ with st.sidebar:
 
 
 # ============================================================
-#  HEADER Y PESTAÑAS
+#  HEADER
 # ============================================================
 st.title("⚽ LuciSport AI")
-st.caption("Dixon-Coles + IA Groq + Odds API + Supabase")
+st.caption("Dixon-Coles + Gemini + Odds API + Supabase")
 
 t1, t2, t3, t4, t5, t6 = st.tabs([
     "📅 Partidos",
@@ -796,14 +799,12 @@ with t1:
                     with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
                         try:
                             picks = analizar(m, liga_codigo)
-                            guardados = 0
                             for p in picks:
                                 if not (PROB_MIN <= p["prob"] <= PROB_MAX
                                         and p["fair_odd"] >= CUOTA_MIN):
                                     continue
                                 es_value = (p.get("edge_%") or 0) > 3
                                 guardar_pick(m, p, USER_ID, es_value=es_value)
-                                guardados += 1
                             ia = ia_analizar_completo(m, picks) if usar_ia else None
                             res.append({
                                 "partido": f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}",
@@ -830,13 +831,13 @@ with t1:
                 previos = [a for a in st.session_state.analisis
                            if a.get("partido") not in partes_nuevos]
                 st.session_state.analisis = previos + res
-                st.success(f"✅ {len(res)} partidos analizados. Total: {len(st.session_state.analisis)}")
+                st.success(f"✅ {len(res)} analizados. Total: {len(st.session_state.analisis)}")
                 st.rerun()
 
         if st.session_state.analisis:
             ligas_acum = sorted(set(a.get("liga_nombre", a.get("liga", "?"))
                                     for a in st.session_state.analisis))
-            st.caption(f"📊 Análisis acumulados de **{len(ligas_acum)}** liga(s): "
+            st.caption(f"📊 Acumulados: **{len(ligas_acum)}** liga(s): "
                        f"_{', '.join(ligas_acum)}_")
 
         for a in st.session_state.analisis:
@@ -858,7 +859,7 @@ with t1:
                                   key=lambda x: (x.get("edge_%") or -999, x["prob"]),
                                   reverse=True)[:5]
                     if not top5:
-                        st.caption(f"Sin picks entre {int(PROB_MIN)}% y {int(PROB_MAX)}%")
+                        st.caption("Sin picks que cumplan filtros")
                     for j, p in enumerate(top5):
                         with st.container(border=True):
                             st.write(f"**{p['market']}** — {p['selection']}")
@@ -882,10 +883,10 @@ with t1:
                                 st.toast(f"Añadido: {p['selection']}")
 
                 with c2:
-                    st.markdown("#### 🧠 Análisis IA")
+                    st.markdown("#### 🧠 Análisis IA (Gemini)")
                     ia = a.get("ia")
                     if not ia:
-                        st.caption("Sin IA. Activa el toggle y re-analiza.")
+                        st.caption("Sin IA. Activa el toggle **IA (Gemini)** y re-analiza.")
                     else:
                         ctx = ia.get("contexto", "")
                         if ctx:
@@ -971,8 +972,7 @@ with t2:
     candidatos_esc.sort(key=lambda x: x["fecha"])
 
     if candidatos_esc:
-        with st.expander(f"🔍 Ver {len(candidatos_esc)} candidatos",
-                         expanded=False):
+        with st.expander(f"🔍 Ver {len(candidatos_esc)} candidatos", expanded=False):
             for i, p in enumerate(candidatos_esc[:20]):
                 st.write(f"• **[{p['market']}] {p['selection']}** — {p['partido']} "
                          f"({p['fecha'][11:16]}) @{p['cuota_ref']:.2f}")
@@ -1048,11 +1048,10 @@ with t2:
                 if ok:
                     st.success(f"✅ Guardada: {nombre_esc}")
         with col_b:
-            st.write("**Opciones:**")
             if st.button("📲 Telegram", use_container_width=True):
-                msg = f"🔺 *RETO ESCALERA*\n\n"
+                msg = "🔺 *RETO ESCALERA*\n\n"
                 for s in sim["simulacion"]:
-                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}) [{s.get('Liga', '?')}]\n"
+                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}) [{s.get('Liga','?')}]\n"
                             f"  [{s['Mercado']}] {s['Pick']}\n"
                             f"  _{s['Partido']}_ @{s['Cuota']}\n\n")
                 msg += f"💰 Final: *${sim['capital_final']:.2f}*"
