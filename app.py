@@ -1,9 +1,12 @@
-"""LuciSport AI — versión completa con Value Bets y persistencia."""
+"""LuciSport AI — con Login y IA."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
 
 
+# ============================================================
+#  CONFIGURACIÓN
+# ============================================================
 def _get(key, default=""):
     try:
         if key in st.secrets:
@@ -24,6 +27,8 @@ TELEGRAM_TOKEN = _get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT = _get("TELEGRAM_CHAT_ID")
 ODDS_KEYS = [k.strip() for k in _get("ODDS_API_KEYS", "").split(",") if k.strip()]
 GROQ_KEY = _get("GROQ_API_KEY", "")
+SUPABASE_URL = _get("SUPABASE_URL", "")
+SUPABASE_KEY = _get("SUPABASE_KEY", "")
 
 HEADERS = {'X-Auth-Token': FOOTBALL_KEY}
 
@@ -42,6 +47,9 @@ LIGAS = {"Premier League": "PL", "La Liga": "PD", "Serie A": "SA",
          "Europa League": "ELI", "Libertadores": "CLI"}
 
 
+# ============================================================
+#  SUPABASE
+# ============================================================
 def _limpiar_url(url):
     if not url:
         return ""
@@ -54,17 +62,47 @@ def _limpiar_url(url):
 
 @st.cache_resource(show_spinner=False)
 def get_supabase():
-    url = _limpiar_url(_get("SUPABASE_URL", ""))
-    key = _get("SUPABASE_KEY", "").strip()
-    if not url or not key:
-        st.error("⚠️ Faltan SUPABASE_URL o SUPABASE_KEY en los Secrets")
+    url = _limpiar_url(SUPABASE_URL)
+    if not url or not SUPABASE_KEY:
+        st.error("⚠️ Faltan SUPABASE_URL o SUPABASE_KEY")
         st.stop()
-    return create_client(url, key)
+    return create_client(url, SUPABASE_KEY)
 
 
-def guardar_pick(match, pick, estado="PENDIENTE", es_value=False):
+def login_usuario(email, password):
+    try:
+        r = get_supabase().auth.sign_in_with_password({"email": email, "password": password})
+        return r.user
+    except Exception as e:
+        return None
+
+
+def registrar_usuario(email, password):
+    try:
+        r = get_supabase().auth.sign_up({"email": email, "password": password})
+        return r.user
+    except Exception as e:
+        st.error(f"Error al registrar: {e}")
+        return None
+
+
+def cerrar_sesion():
+    try:
+        get_supabase().auth.sign_out()
+    except Exception:
+        pass
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+    st.rerun()
+
+
+# ============================================================
+#  BASE DE DATOS (filtrada por usuario)
+# ============================================================
+def guardar_pick(match, pick, user_id, estado="PENDIENTE", es_value=False):
     match_id = f"{match['homeTeam']['id']}_{match['awayTeam']['id']}_{(match.get('utcDate') or '')[:16]}"
     fila = {
+        "user_id": user_id,
         "match_id": match_id,
         "fecha_partido": (match.get('utcDate') or '')[:16],
         "liga": match.get('league_code', ''),
@@ -81,15 +119,18 @@ def guardar_pick(match, pick, estado="PENDIENTE", es_value=False):
         "es_value": es_value,
     }
     try:
-        get_supabase().table("picks").upsert(fila).execute()
+        get_supabase().table("picks").upsert(
+            fila, on_conflict="user_id,match_id,mercado,seleccion"
+        ).execute()
     except Exception as e:
         st.warning(f"Error guardando pick: {e}")
 
 
-def listar_picks(estado=None, limite=200, solo_value=None):
-    """solo_value: True=solo value bets, False=solo no-value, None=todos"""
+def listar_picks(user_id, estado=None, limite=200, solo_value=None):
     try:
-        q = get_supabase().table("picks").select("*").order("creado", desc=True).limit(limite)
+        q = (get_supabase().table("picks").select("*")
+             .eq("user_id", user_id)
+             .order("creado", desc=True).limit(limite))
         if estado:
             q = q.eq("estado", estado)
         if solo_value is not None:
@@ -100,9 +141,10 @@ def listar_picks(estado=None, limite=200, solo_value=None):
         return []
 
 
-def stats_por_estado():
+def stats_por_estado(user_id):
     try:
-        rows = get_supabase().table("picks").select("estado").execute().data or []
+        rows = (get_supabase().table("picks").select("estado")
+                .eq("user_id", user_id).execute().data or [])
         res = {}
         for r in rows:
             res[r["estado"]] = res.get(r["estado"], 0) + 1
@@ -128,8 +170,8 @@ def eliminar_pick(pick_id):
         st.warning(f"Error eliminando: {e}")
 
 
-def stats_rendimiento():
-    rows = listar_picks(limite=2000)
+def stats_rendimiento(user_id):
+    rows = listar_picks(user_id, limite=2000)
     ganados = sum(1 for r in rows if r["estado"] == "GANADO")
     perdidos = sum(1 for r in rows if r["estado"] == "PERDIDO")
     anulados = sum(1 for r in rows if r["estado"] == "ANULADO")
@@ -165,9 +207,10 @@ def stats_rendimiento():
     }
 
 
-def guardar_escalera(nombre, liga, cuota_obj, stake_ini, n_pasos, pasos, capital_final):
+def guardar_escalera(user_id, nombre, liga, cuota_obj, stake_ini, n_pasos, pasos, capital_final):
     try:
         fila = {
+            "user_id": user_id,
             "nombre": nombre,
             "liga_inicio": liga,
             "cuota_objetivo": cuota_obj,
@@ -184,9 +227,11 @@ def guardar_escalera(nombre, liga, cuota_obj, stake_ini, n_pasos, pasos, capital
         return False
 
 
-def listar_escaleras(limite=50):
+def listar_escaleras(user_id, limite=50):
     try:
-        q = get_supabase().table("escaleras").select("*").order("creado", desc=True).limit(limite)
+        q = (get_supabase().table("escaleras").select("*")
+             .eq("user_id", user_id)
+             .order("creado", desc=True).limit(limite))
         return q.execute().data or []
     except Exception as e:
         st.warning(f"Error leyendo escaleras: {e}")
@@ -200,19 +245,13 @@ def eliminar_escalera(esc_id):
         st.warning(f"Error eliminando: {e}")
 
 
-def reconstruir_analisis_desde_bd():
-    """Reconstruye st.session_state.analisis desde Supabase agrupando por partido."""
+def reconstruir_analisis_desde_bd(user_id):
     try:
-        rows = (get_supabase()
-                .table("picks")
-                .select("*")
-                .eq("estado", "PENDIENTE")
-                .order("fecha_partido", desc=False)
-                .limit(500)
-                .execute()
-                .data or [])
-    except Exception as e:
-        st.warning(f"No se pudo reconstruir: {e}")
+        rows = (get_supabase().table("picks").select("*")
+                .eq("user_id", user_id).eq("estado", "PENDIENTE")
+                .order("fecha_partido", desc=False).limit(500)
+                .execute().data or [])
+    except Exception:
         return []
 
     if not rows:
@@ -244,6 +283,9 @@ def reconstruir_analisis_desde_bd():
     return list(partidos_dict.values())
 
 
+# ============================================================
+#  MODELO MATEMÁTICO
+# ============================================================
 def poisson(lam, k):
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
@@ -290,6 +332,9 @@ def _rl(t=1.5):
     _LAST[0] = time.time()
 
 
+# ============================================================
+#  DATOS API
+# ============================================================
 @st.cache_data(ttl=43200, show_spinner=False)
 def get_team_data(tid):
     _rl()
@@ -398,6 +443,9 @@ def get_odds_oddsapi(match):
     return {k: v for k, v in out.items() if v}
 
 
+# ============================================================
+#  MOTOR DE ANÁLISIS
+# ============================================================
 def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     hs = get_team_data(match['homeTeam']['id'])
@@ -455,31 +503,86 @@ def analizar(match, liga_codigo):
     return picks
 
 
-def ia_analizar(match, picks):
-    if not GROQ_KEY: return None
-    h, a = match['homeTeam']['name'], match['awayTeam']['name']
-    sys_prompt = """Analista de apuestas. Devuelve JSON:
-{"analisis":"3 frases","pick_recomendado":"x","confianza":7,"riesgos":["r1"]}"""
-    con_edge = [p for p in picks if p.get("edge_%", 0) > 3][:5]
-    if not con_edge:
-        con_edge = sorted(picks, key=lambda x: x["prob"], reverse=True)[:5]
-    txt = f"PARTIDO: {h} vs {a}\nPICKS:\n"
-    for p in con_edge:
-        edge_txt = f" (edge {p['edge_%']:+.1f}%)" if p.get("edge_%") else ""
-        txt += f"- [{p['market']}] {p['selection']}: {p['prob']}%{edge_txt}\n"
+# ============================================================
+#  IA AVANZADA
+# ============================================================
+def ia_analizar_completo(match, picks, cuotas_reales=None):
+    """
+    Análisis avanzado con IA. Recibe partido + picks + cuotas.
+    Devuelve análisis enriquecido.
+    """
+    if not GROQ_KEY:
+        return None
+    h = match['homeTeam']['name']
+    a = match['awayTeam']['name']
+    fecha = (match.get('utcDate') or '')[:16]
+
+    sys_prompt = """Eres un analista profesional de apuestas deportivas con 15 años de experiencia.
+Recibes datos de un partido de fútbol y los picks generados por un modelo Dixon-Coles.
+
+Tu trabajo:
+1. Analizar el partido de forma concisa (2-3 frases de contexto).
+2. Identificar la MEJOR apuesta entre los picks (si existe).
+3. Evaluar el VALOR de cada pick con edge positivo.
+4. Alertar sobre riesgos o señales contradictorias.
+5. Dar una confianza del 1 al 10 al pick recomendado.
+
+FORMATO DE RESPUESTA (JSON estricto):
+{
+  "contexto": "análisis breve de 2-3 frases sobre el partido",
+  "mejor_pick": {
+    "mercado": "nombre del mercado",
+    "seleccion": "selección exacta",
+    "razon": "por qué es la mejor opción"
+  },
+  "confianza": 7,
+  "riesgos": ["riesgo1", "riesgo2"],
+  "resumen": "una frase final con la recomendación principal"
+}"""
+
+    # Preparar los picks para la IA (los más relevantes)
+    picks_ordenados = sorted(
+        picks,
+        key=lambda x: (x.get("edge_%") or -999, x["prob"]),
+        reverse=True
+    )[:8]
+
+    txt = f"""PARTIDO: {h} vs {a}
+FECHA: {fecha}
+
+=== PICKS DEL MODELO ===
+"""
+    for p in picks_ordenados:
+        edge = p.get("edge_%")
+        cuota_r = p.get("cuota_real")
+        linea = f"- [{p['market']}] {p['selection']}: prob {p['prob']}%, cuota justa {p['fair_odd']:.2f}"
+        if cuota_r:
+            linea += f", cuota real {cuota_r:.2f}"
+        if edge is not None:
+            linea += f", edge {edge:+.1f}%"
+        txt += linea + "\n"
+
+    txt += "\nGenera el análisis en el formato JSON especificado."
+
     try:
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}"},
-            json={"model": "llama-3.3-70b-versatile",
-                  "messages": [{"role": "system", "content": sys_prompt},
-                               {"role": "user", "content": txt}],
-                  "temperature": 0.3, "max_tokens": 500,
-                  "response_format": {"type": "json_object"}},
+            headers={"Authorization": f"Bearer {GROQ_KEY}",
+                     "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": txt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 800,
+                "response_format": {"type": "json_object"},
+            },
             timeout=30)
         if r.status_code == 200:
             return json.loads(r.json()["choices"][0]["message"]["content"])
-    except Exception:
+    except Exception as e:
         pass
     return None
 
@@ -496,8 +599,77 @@ def tg_send(msg):
         return False
 
 
+# ============================================================
+#  UI — CONFIGURACIÓN DE PÁGINA
+# ============================================================
 st.set_page_config(page_title="LuciSport AI", page_icon="⚽", layout="wide",
                    initial_sidebar_state="collapsed")
+
+
+# ============================================================
+#  PANTALLA DE LOGIN
+# ============================================================
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if st.session_state.user is None:
+    st.markdown("# ⚽ LuciSport AI")
+    st.markdown("### Inicia sesión o crea tu cuenta")
+    st.divider()
+
+    tab_login, tab_registro = st.tabs(["🔑 Iniciar sesión", "📝 Crear cuenta"])
+
+    with tab_login:
+        with st.form("form_login"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Contraseña", type="password", key="login_pass")
+            submit = st.form_submit_button("Entrar", type="primary",
+                                            use_container_width=True)
+            if submit:
+                if not email or not password:
+                    st.error("Completa email y contraseña")
+                else:
+                    user = login_usuario(email, password)
+                    if user:
+                        st.session_state.user = {
+                            "id": user.id,
+                            "email": user.email,
+                        }
+                        st.session_state.analisis_cargado = False
+                        st.success(f"Bienvenido {user.email}")
+                        st.rerun()
+                    else:
+                        st.error("Email o contraseña incorrectos")
+
+    with tab_registro:
+        with st.form("form_registro"):
+            email_r = st.text_input("Email", key="reg_email")
+            password_r = st.text_input("Contraseña", type="password", key="reg_pass")
+            password_r2 = st.text_input("Repetir contraseña", type="password",
+                                         key="reg_pass2")
+            submit_r = st.form_submit_button("Crear cuenta", type="primary",
+                                              use_container_width=True)
+            if submit_r:
+                if not email_r or not password_r:
+                    st.error("Completa todos los campos")
+                elif password_r != password_r2:
+                    st.error("Las contraseñas no coinciden")
+                elif len(password_r) < 6:
+                    st.error("La contraseña debe tener al menos 6 caracteres")
+                else:
+                    user = registrar_usuario(email_r, password_r)
+                    if user:
+                        st.success("Cuenta creada. Inicia sesión.")
+                    else:
+                        st.error("No se pudo crear la cuenta")
+    st.stop()
+
+
+# ============================================================
+#  USUARIO AUTENTICADO
+# ============================================================
+USER_ID = st.session_state.user["id"]
+USER_EMAIL = st.session_state.user["email"]
 
 if "partidos" not in st.session_state:
     st.session_state.partidos = []
@@ -507,25 +679,39 @@ if "boleto" not in st.session_state:
     st.session_state.boleto = []
 if "analisis_cargado" not in st.session_state:
     st.session_state.analisis_cargado = False
+if "usar_ia" not in st.session_state:
+    st.session_state.usar_ia = True
 
 
-# Recuperar análisis de Supabase la primera vez
+# Recuperar análisis
 if not st.session_state.analisis_cargado:
     with st.spinner("Recuperando análisis guardados..."):
-        recuperados = reconstruir_analisis_desde_bd()
+        recuperados = reconstruir_analisis_desde_bd(USER_ID)
     if recuperados:
         st.session_state.analisis = recuperados
     st.session_state.analisis_cargado = True
 
 
+# ============================================================
+#  SIDEBAR
+# ============================================================
 with st.sidebar:
     st.title("⚽ LuciSport AI")
+    st.caption(f"👤 {USER_EMAIL}")
+
+    if st.button("🚪 Cerrar sesión", use_container_width=True):
+        cerrar_sesion()
+
+    st.divider()
+
     liga_nombre = st.selectbox("Liga", list(LIGAS.keys()))
     liga_codigo = LIGAS[liga_nombre]
     dias = st.slider("Días a futuro", 1, 14, 5)
-    usar_ia = st.toggle("IA (Groq)", value=False)
+    usar_ia = st.toggle("IA (Groq)", value=st.session_state.usar_ia)
+    st.session_state.usar_ia = usar_ia
     max_p = st.slider("Máx. partidos", 1, 10, 5)
     st.divider()
+
     if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
         with st.spinner("Cargando..."):
             st.session_state.partidos = cargar_partidos(liga_codigo, dias)
@@ -538,18 +724,13 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    s = stats_por_estado()
+    s = stats_por_estado(USER_ID)
     st.caption(
         f"📊 BD: {s.get('PENDIENTE', 0)} pend · "
         f"{s.get('GANADO', 0)} gan · {s.get('PERDIDO', 0)} per · "
         f"{s.get('ANULADO', 0)} anul"
     )
     st.caption(f"🧠 Análisis en memoria: **{len(st.session_state.analisis)}** partidos")
-
-    with st.expander("🔬 Debug APIs"):
-        st.caption(f"Supabase: `{_limpiar_url(_get('SUPABASE_URL',''))[:35]}...`")
-        st.caption(f"Odds API: {len(ODDS_KEYS)} keys")
-        st.caption(f"Groq: {'✅' if GROQ_KEY else '❌'}")
 
     st.divider()
     st.subheader("🧾 Boleto")
@@ -574,8 +755,11 @@ with st.sidebar:
             st.rerun()
 
 
+# ============================================================
+#  HEADER Y PESTAÑAS
+# ============================================================
 st.title("⚽ LuciSport AI")
-st.caption("Dixon-Coles + Groq + Odds API + Supabase")
+st.caption("Dixon-Coles + IA Groq + Odds API + Supabase")
 
 t1, t2, t3, t4, t5, t6 = st.tabs([
     "📅 Partidos",
@@ -587,6 +771,9 @@ t1, t2, t3, t4, t5, t6 = st.tabs([
 ])
 
 
+# ============================================================
+#  TAB 1 — PARTIDOS
+# ============================================================
 with t1:
     if not st.session_state.partidos:
         st.info("👈 Menú » → elige liga → Cargar partidos")
@@ -615,9 +802,9 @@ with t1:
                                         and p["fair_odd"] >= CUOTA_MIN):
                                     continue
                                 es_value = (p.get("edge_%") or 0) > 3
-                                guardar_pick(m, p, es_value=es_value)
+                                guardar_pick(m, p, USER_ID, es_value=es_value)
                                 guardados += 1
-                            ia = ia_analizar(m, picks) if usar_ia else None
+                            ia = ia_analizar_completo(m, picks) if usar_ia else None
                             res.append({
                                 "partido": f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}",
                                 "fecha": (m.get('utcDate') or '')[:16],
@@ -643,8 +830,7 @@ with t1:
                 previos = [a for a in st.session_state.analisis
                            if a.get("partido") not in partes_nuevos]
                 st.session_state.analisis = previos + res
-                st.success(f"✅ {len(res)} partidos analizados. "
-                           f"Total acumulado: {len(st.session_state.analisis)}")
+                st.success(f"✅ {len(res)} partidos analizados. Total: {len(st.session_state.analisis)}")
                 st.rerun()
 
         if st.session_state.analisis:
@@ -662,7 +848,7 @@ with t1:
             with st.container(border=True):
                 st.subheader(a["partido"])
                 st.caption(f"🕐 {a['fecha']} · {a.get('liga_nombre', a.get('liga',''))}")
-                c1, c2 = st.columns(2)
+                c1, c2 = st.columns([3, 2])
                 with c1:
                     st.markdown("#### 📈 Picks del modelo")
                     candidatos = [p for p in a["picks"]
@@ -672,8 +858,7 @@ with t1:
                                   key=lambda x: (x.get("edge_%") or -999, x["prob"]),
                                   reverse=True)[:5]
                     if not top5:
-                        st.caption(f"Sin picks entre {int(PROB_MIN)}% y {int(PROB_MAX)}% "
-                                   f"con cuota ≥ {CUOTA_MIN}")
+                        st.caption(f"Sin picks entre {int(PROB_MIN)}% y {int(PROB_MAX)}%")
                     for j, p in enumerate(top5):
                         with st.container(border=True):
                             st.write(f"**{p['market']}** — {p['selection']}")
@@ -695,32 +880,45 @@ with t1:
                                     "cuota": cr if cr else p["fair_odd"],
                                 })
                                 st.toast(f"Añadido: {p['selection']}")
+
                 with c2:
-                    st.markdown("#### 🧠 IA")
+                    st.markdown("#### 🧠 Análisis IA")
                     ia = a.get("ia")
                     if not ia:
-                        st.caption("Sin IA (configura GROQ_API_KEY)")
+                        st.caption("Sin IA. Activa el toggle y re-analiza.")
                     else:
-                        st.info(ia.get("analisis", ""))
-                        st.write(f"**Pick:** {ia.get('pick_recomendado', '-')}")
-                        st.write(f"**Confianza:** {ia.get('confianza', 0)}/10")
+                        ctx = ia.get("contexto", "")
+                        if ctx:
+                            st.info(ctx)
+                        mejor = ia.get("mejor_pick") or {}
+                        if mejor:
+                            st.markdown("**🎯 Mejor pick:**")
+                            st.write(f"_{mejor.get('mercado', '-')}_: "
+                                     f"**{mejor.get('seleccion', '-')}**")
+                            if mejor.get("razon"):
+                                st.caption(mejor["razon"])
+                        conf = ia.get("confianza", 0)
+                        st.write(f"**Confianza:** {conf}/10")
                         if ia.get("riesgos"):
                             st.warning("⚠️ " + " · ".join(ia["riesgos"]))
+                        if ia.get("resumen"):
+                            st.caption(f"💡 {ia['resumen']}")
 
 
+# ============================================================
+#  TAB 2 — ESCALERA
+# ============================================================
 with t2:
     st.subheader("🔺 Reto Escalera")
-    st.caption("Encadena apuestas con cuota fija (~1.40) sin repetir partido "
-               "ni solapar horarios.")
+    st.caption("Encadena apuestas con cuota fija sin repetir partido ni solapar horarios.")
 
     ligas_acum = sorted(set(a.get("liga_nombre", a.get("liga", "?"))
                             for a in st.session_state.analisis))
     if ligas_acum:
         st.info(f"📊 Picks acumulados de **{len(ligas_acum)}** liga(s): "
-                f"_{', '.join(ligas_acum)}_ · "
-                f"**{len(st.session_state.analisis)}** partidos")
+                f"_{', '.join(ligas_acum)}_")
     else:
-        st.warning("👈 No hay análisis. Analiza partidos de una o más ligas primero.")
+        st.warning("👈 Analiza partidos primero.")
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -742,12 +940,11 @@ with t2:
             "Paso": i,
             "Capital antes": round(capital, 2),
             "Capital después": round(capital_nuevo, 2),
-            "Ganancia del paso": round(capital_nuevo - capital, 2),
+            "Ganancia": round(capital_nuevo - capital, 2),
         })
         capital = capital_nuevo
     st.dataframe(progresion, use_container_width=True, hide_index=True)
-    st.success(f"💰 Capital final tras {n_pasos} pasos: **${capital:.2f}** "
-               f"(x{capital/stake_inicial:.1f} sobre el inicial)")
+    st.success(f"💰 Capital final tras {n_pasos} pasos: **${capital:.2f}**")
 
     st.divider()
     tolerancia = st.slider("Tolerancia en la cuota (±)", 0.02, 0.20, 0.10, 0.01)
@@ -774,20 +971,18 @@ with t2:
     candidatos_esc.sort(key=lambda x: x["fecha"])
 
     if candidatos_esc:
-        with st.expander(f"🔍 Ver {len(candidatos_esc)} candidatos (oculto por defecto)",
+        with st.expander(f"🔍 Ver {len(candidatos_esc)} candidatos",
                          expanded=False):
             for i, p in enumerate(candidatos_esc[:20]):
                 st.write(f"• **[{p['market']}] {p['selection']}** — {p['partido']} "
-                         f"_{p.get('liga_nombre', p.get('liga','?'))}_ "
-                         f"({p['fecha'][11:16]}) @{p['cuota_ref']:.2f} "
-                         f"[{p['prob']}%]")
+                         f"({p['fecha'][11:16]}) @{p['cuota_ref']:.2f}")
     else:
-        st.info("👈 Analiza partidos primero para encontrar candidatos.")
+        st.info("👈 Analiza partidos primero.")
 
     st.divider()
     st.markdown("### 🧮 Simulador")
 
-    if st.button("🎲 Simular escalera con los mejores picks", type="primary"):
+    if st.button("🎲 Simular escalera", type="primary"):
         seleccionados = []
         ultima_hora_fin = None
         for p in candidatos_esc:
@@ -803,8 +998,7 @@ with t2:
                 break
 
         if len(seleccionados) < n_pasos:
-            st.warning(f"Solo se encontraron **{len(seleccionados)}** partidos "
-                       f"que no se solapan (necesitas {n_pasos}).")
+            st.warning(f"Solo {len(seleccionados)} partidos sin solapar.")
 
         if seleccionados:
             simulacion = []
@@ -826,8 +1020,7 @@ with t2:
                 capital = capital_despues
 
             st.dataframe(simulacion, use_container_width=True, hide_index=True)
-            st.success(f"💰 Si aciertas los {len(seleccionados)} pasos: "
-                       f"**${capital:.2f}** (x{capital/stake_inicial:.1f})")
+            st.success(f"💰 Si aciertas los {len(seleccionados)}: **${capital:.2f}**")
 
             st.session_state["ultima_simulacion"] = {
                 "seleccionados": seleccionados,
@@ -843,97 +1036,74 @@ with t2:
     if sim:
         st.divider()
         col_a, col_b = st.columns(2)
-
         with col_a:
-            nombre_esc = st.text_input("Nombre de la escalera",
-                                        value=f"Escalera {sim['liga']} "
-                                              f"{datetime.now().strftime('%d/%m/%Y %H:%M')}",
+            nombre_esc = st.text_input("Nombre", value=f"Escalera {sim['liga']} "
+                                        f"{datetime.now().strftime('%d/%m %H:%M')}",
                                         key="esc_nombre")
-            if st.button("💾 Guardar reto escalera", type="primary",
-                         use_container_width=True):
-                ok = guardar_escalera(
-                    nombre_esc,
-                    sim["liga"],
-                    sim["cuota_escalera"],
-                    sim["stake_inicial"],
-                    sim["n_pasos"],
-                    sim["simulacion"],
-                    sim["capital_final"],
-                )
+            if st.button("💾 Guardar reto", type="primary", use_container_width=True):
+                ok = guardar_escalera(USER_ID, nombre_esc, sim["liga"],
+                                       sim["cuota_escalera"], sim["stake_inicial"],
+                                       sim["n_pasos"], sim["simulacion"],
+                                       sim["capital_final"])
                 if ok:
-                    st.success(f"✅ Escalera guardada: {nombre_esc}")
-                else:
-                    st.error("❌ No se pudo guardar")
-
+                    st.success(f"✅ Guardada: {nombre_esc}")
         with col_b:
-            st.write("**Opciones rápidas:**")
-            if st.button("📲 Enviar a Telegram", use_container_width=True):
+            st.write("**Opciones:**")
+            if st.button("📲 Telegram", use_container_width=True):
                 msg = f"🔺 *RETO ESCALERA*\n\n"
-                msg += f"Stake: ${sim['stake_inicial']:.2f} | Pasos: {sim['n_pasos']}\n"
-                msg += f"Cuota objetivo: {sim['cuota_escalera']}\n\n"
                 for s in sim["simulacion"]:
-                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}) "
-                            f"[{s.get('Liga', '?')}]\n"
+                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}) [{s.get('Liga', '?')}]\n"
                             f"  [{s['Mercado']}] {s['Pick']}\n"
-                            f"  _{s['Partido']}_\n"
-                            f"  @{s['Cuota']} → ${s['Capital después']:.2f}\n\n")
-                msg += f"💰 Final: *${sim['capital_final']:.2f}*\n_LuciSport AI_"
-                st.success("✅ Enviado") if tg_send(msg) else st.warning("⚠️ Falló")
-
-            if st.button("➕ Añadir picks al boleto", use_container_width=True):
+                            f"  _{s['Partido']}_ @{s['Cuota']}\n\n")
+                msg += f"💰 Final: *${sim['capital_final']:.2f}*"
+                st.success("✅") if tg_send(msg) else st.warning("⚠️")
+            if st.button("➕ Boleto", use_container_width=True):
                 for p in sim["seleccionados"]:
                     st.session_state.boleto.append({
                         "partido": p["partido"],
                         "seleccion": f"[{p['market']}] {p['selection']}",
                         "cuota": p["cuota_ref"],
                     })
-                st.success(f"✅ {len(sim['seleccionados'])} picks añadidos")
+                st.success(f"✅ {len(sim['seleccionados'])} añadidos")
                 st.rerun()
 
 
+# ============================================================
+#  TAB 3 — ESCALERAS GUARDADAS
+# ============================================================
 with t3:
     st.subheader("📋 Escaleras guardadas")
-
-    escaleras = listar_escaleras(limite=50)
+    escaleras = listar_escaleras(USER_ID)
 
     if not escaleras:
-        st.info("Aún no has guardado ninguna escalera. Ve a la pestaña "
-                "🔺 Escalera, simula y pulsa 💾 Guardar.")
+        st.info("No has guardado ninguna escalera aún.")
     else:
-        st.caption(f"Tienes **{len(escaleras)}** escaleras guardadas")
-
+        st.caption(f"Tienes **{len(escaleras)}** escaleras")
         for esc in escaleras:
             with st.container(border=True):
                 col1, col2, col3 = st.columns([3, 2, 1])
                 with col1:
                     st.write(f"**{esc['nombre']}**")
-                    st.caption(f"🕐 Creada: {esc.get('creado', '')[:16]}")
-                    st.caption(f"Liga: {esc.get('liga_inicio', '-')} · "
-                               f"Cuota obj: {esc.get('cuota_objetivo', '-')}")
+                    st.caption(f"🕐 {esc.get('creado', '')[:16]}")
                 with col2:
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Stake", f"${esc.get('stake_inicial', 0):.2f}")
                     c2.metric("Pasos", esc.get("n_pasos", 0))
                     c3.metric("Final", f"${esc.get('capital_final', 0):.2f}")
                 with col3:
-                    if st.button("🗑️", key=f"del_esc_{esc['id']}",
-                                 use_container_width=True):
+                    if st.button("🗑️", key=f"del_{esc['id']}", use_container_width=True):
                         eliminar_escalera(esc["id"])
                         st.rerun()
-
                 with st.expander("Ver pasos"):
-                    pasos = esc.get("pasos", [])
-                    for p in pasos:
-                        mercado = p.get('Mercado') or p.get('market') or "—"
-                        liga_p = p.get('Liga', esc.get('liga_inicio', '?'))
-                        st.write(f"**Paso {p.get('Paso', '?')}** "
-                                 f"({p.get('Hora', '?')}) [{liga_p}]")
-                        st.write(f"[{mercado}] {p.get('Pick', p.get('selection', '?'))}")
-                        st.caption(f"{p.get('Partido', '?')} — "
-                                   f"@{p.get('Cuota', 0)} → "
-                                   f"${p.get('Capital después', 0):.2f}")
+                    for p in esc.get("pasos", []):
+                        st.write(f"**Paso {p.get('Paso', '?')}** ({p.get('Hora','?')})")
+                        st.write(f"[{p.get('Mercado', '—')}] {p.get('Pick', '?')}")
+                        st.caption(f"{p.get('Partido','?')} — @{p.get('Cuota', 0)}")
 
 
+# ============================================================
+#  TAB 4 — BOLETO
+# ============================================================
 with t4:
     st.subheader("🧾 Boleto")
     if not st.session_state.boleto:
@@ -954,14 +1124,17 @@ with t4:
             for i, b in enumerate(st.session_state.boleto, 1):
                 msg += f"{i}. {b['seleccion']} · @{b['cuota']:.2f}\n"
             msg += f"\nCuota: *{ct:.2f}* | Ganancia: {stake * ct:.2f}"
-            st.success("✅ Enviado") if tg_send(msg) else st.warning("⚠️ Falló")
+            st.success("✅") if tg_send(msg) else st.warning("⚠️")
 
 
+# ============================================================
+#  TAB 5 — VALUE BETS
+# ============================================================
 with t5:
     st.subheader("💰 Value Bets")
-    st.caption("Picks con **edge > 3%** — los que tienen valor apostable.")
+    st.caption("Picks con edge > 3% — valor apostable.")
 
-    rend = stats_rendimiento()
+    rend = stats_rendimiento(USER_ID)
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("✅ Ganados", rend["ganados"])
     c2.metric("❌ Perdidos", rend["perdidos"])
@@ -975,12 +1148,10 @@ with t5:
                          f"· ⭕ {m['anulados']} → Hit **{m['hit']}%**")
 
     st.divider()
-
-    filtro = st.radio("Filtrar:",
-                      ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
-                      horizontal=True, key="filtro_value")
+    filtro = st.radio("Filtrar:", ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
+                      horizontal=True, key="filtro_v")
     estado = None if filtro == "Todos" else filtro
-    picks = listar_picks(estado=estado, limite=500, solo_value=True)
+    picks = listar_picks(USER_ID, estado=estado, limite=500, solo_value=True)
 
     if not picks:
         st.info(f"No hay Value Bets con estado **{filtro}**")
@@ -997,8 +1168,7 @@ with t5:
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
                     c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
-                    c3.metric("C. real",
-                              f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
+                    c3.metric("C. real", f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
                     edge = p.get("edge_pct") or 0
                     if edge > 3:
                         st.success(f"✅ Edge: +{edge:.1f}%")
@@ -1006,34 +1176,31 @@ with t5:
                     iconos = {"GANADO": "✅", "PERDIDO": "❌", "ANULADO": "⭕"}
                     st.write(f"{iconos.get(est, '⏳')} **{est}**")
                 with col_acc:
-                    st.write("**Cambiar estado:**")
                     b1, b2, b3 = st.columns(3)
                     with b1:
                         if st.button("✅", key=f"gv_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "GANADO")
-                            st.rerun()
+                            cambiar_estado(pid, "GANADO"); st.rerun()
                     with b2:
                         if st.button("❌", key=f"pv_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "PERDIDO")
-                            st.rerun()
+                            cambiar_estado(pid, "PERDIDO"); st.rerun()
                     with b3:
                         if st.button("⭕", key=f"av_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "ANULADO")
-                            st.rerun()
-                    if st.button("🗑️ Eliminar", key=f"dv_{pid}", use_container_width=True):
-                        eliminar_pick(pid)
-                        st.rerun()
+                            cambiar_estado(pid, "ANULADO"); st.rerun()
+                    if st.button("🗑️", key=f"dv_{pid}", use_container_width=True):
+                        eliminar_pick(pid); st.rerun()
 
 
+# ============================================================
+#  TAB 6 — OTRAS APUESTAS
+# ============================================================
 with t6:
     st.subheader("🎲 Otras Apuestas")
-    st.caption("Picks sin edge (o edge bajo). Útiles como referencia.")
+    st.caption("Picks sin edge o edge bajo. Referencia.")
 
-    filtro = st.radio("Filtrar:",
-                      ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
-                      horizontal=True, key="filtro_otras")
+    filtro = st.radio("Filtrar:", ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
+                      horizontal=True, key="filtro_o")
     estado = None if filtro == "Todos" else filtro
-    picks = listar_picks(estado=estado, limite=500, solo_value=False)
+    picks = listar_picks(USER_ID, estado=estado, limite=500, solo_value=False)
 
     if not picks:
         st.info(f"No hay Otras Apuestas con estado **{filtro}**")
@@ -1050,29 +1217,20 @@ with t6:
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
                     c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
-                    c3.metric("C. real",
-                              f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
-                    edge = p.get("edge_pct")
-                    if edge is not None:
-                        st.caption(f"Edge: {edge:+.1f}%")
+                    c3.metric("C. real", f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
                     est = p["estado"]
                     iconos = {"GANADO": "✅", "PERDIDO": "❌", "ANULADO": "⭕"}
                     st.write(f"{iconos.get(est, '⏳')} **{est}**")
                 with col_acc:
-                    st.write("**Cambiar estado:**")
                     b1, b2, b3 = st.columns(3)
                     with b1:
                         if st.button("✅", key=f"go_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "GANADO")
-                            st.rerun()
+                            cambiar_estado(pid, "GANADO"); st.rerun()
                     with b2:
                         if st.button("❌", key=f"po_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "PERDIDO")
-                            st.rerun()
+                            cambiar_estado(pid, "PERDIDO"); st.rerun()
                     with b3:
                         if st.button("⭕", key=f"ao_{pid}", use_container_width=True):
-                            cambiar_estado(pid, "ANULADO")
-                            st.rerun()
-                    if st.button("🗑️ Eliminar", key=f"do_{pid}", use_container_width=True):
-                        eliminar_pick(pid)
-                        st.rerun()
+                            cambiar_estado(pid, "ANULADO"); st.rerun()
+                    if st.button("🗑️", key=f"do_{pid}", use_container_width=True):
+                        eliminar_pick(pid); st.rerun()
