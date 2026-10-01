@@ -1,4 +1,4 @@
-"""LuciSport AI — versión completa con persistencia."""
+"""LuciSport AI — versión completa con Value Bets y persistencia."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
@@ -62,7 +62,7 @@ def get_supabase():
     return create_client(url, key)
 
 
-def guardar_pick(match, pick, estado="PENDIENTE"):
+def guardar_pick(match, pick, estado="PENDIENTE", es_value=False):
     match_id = f"{match['homeTeam']['id']}_{match['awayTeam']['id']}_{(match.get('utcDate') or '')[:16]}"
     fila = {
         "match_id": match_id,
@@ -78,6 +78,7 @@ def guardar_pick(match, pick, estado="PENDIENTE"):
         "edge_pct": pick.get('edge_%'),
         "stake_sug": pick.get('stake_sug'),
         "estado": estado,
+        "es_value": es_value,
     }
     try:
         get_supabase().table("picks").upsert(fila).execute()
@@ -85,11 +86,14 @@ def guardar_pick(match, pick, estado="PENDIENTE"):
         st.warning(f"Error guardando pick: {e}")
 
 
-def listar_picks(estado=None, limite=200):
+def listar_picks(estado=None, limite=200, solo_value=None):
+    """solo_value: True=solo value bets, False=solo no-value, None=todos"""
     try:
         q = get_supabase().table("picks").select("*").order("creado", desc=True).limit(limite)
         if estado:
             q = q.eq("estado", estado)
+        if solo_value is not None:
+            q = q.eq("es_value", solo_value)
         return q.execute().data or []
     except Exception as e:
         st.warning(f"Error leyendo picks: {e}")
@@ -197,10 +201,7 @@ def eliminar_escalera(esc_id):
 
 
 def reconstruir_analisis_desde_bd():
-    """
-    Lee todos los picks PENDIENTES de Supabase y reconstruye
-    el st.session_state.analisis agrupándolos por partido.
-    """
+    """Reconstruye st.session_state.analisis desde Supabase agrupando por partido."""
     try:
         rows = (get_supabase()
                 .table("picks")
@@ -395,7 +396,7 @@ def get_odds_oddsapi(match):
         if d["Over"]: out["Goles totales"]["+" + pt] = avg(d["Over"])
         if d["Under"]: out["Goles totales"]["-" + pt] = avg(d["Under"])
     return {k: v for k, v in out.items() if v}
-    
+
 
 def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
@@ -576,7 +577,14 @@ with st.sidebar:
 st.title("⚽ LuciSport AI")
 st.caption("Dixon-Coles + Groq + Odds API + Supabase")
 
-t1, t2, t3, t4, t5 = st.tabs(["📅 Partidos", "🔺 Escalera", "📋 Escaleras", "🧾 Boleto", "📚 Historial"])
+t1, t2, t3, t4, t5, t6 = st.tabs([
+    "📅 Partidos",
+    "🔺 Escalera",
+    "📋 Escaleras",
+    "🧾 Boleto",
+    "💰 Value Bets",
+    "🎲 Otras Apuestas",
+])
 
 
 with t1:
@@ -601,12 +609,14 @@ with t1:
                     with st.spinner(f"Analizando {m['homeTeam']['name']}..."):
                         try:
                             picks = analizar(m, liga_codigo)
-                            top = [p for p in picks
-                                   if PROB_MIN <= p["prob"] <= PROB_MAX
-                                   and p["fair_odd"] >= CUOTA_MIN
-                                   and p.get("edge_%", 0) > 3][:5]
-                            for p in top:
-                                guardar_pick(m, p)
+                            guardados = 0
+                            for p in picks:
+                                if not (PROB_MIN <= p["prob"] <= PROB_MAX
+                                        and p["fair_odd"] >= CUOTA_MIN):
+                                    continue
+                                es_value = (p.get("edge_%") or 0) > 3
+                                guardar_pick(m, p, es_value=es_value)
+                                guardados += 1
                             ia = ia_analizar(m, picks) if usar_ia else None
                             res.append({
                                 "partido": f"{m['homeTeam']['name']} vs {m['awayTeam']['name']}",
@@ -629,7 +639,6 @@ with t1:
                                 "error": f"{type(e).__name__}: {e}",
                                 "traceback": traceback.format_exc(),
                             })
-                # Evitar duplicados
                 partes_nuevos = {a["partido"] for a in res}
                 previos = [a for a in st.session_state.analisis
                            if a.get("partido") not in partes_nuevos]
@@ -638,7 +647,6 @@ with t1:
                            f"Total acumulado: {len(st.session_state.analisis)}")
                 st.rerun()
 
-        # Mostrar todos los análisis acumulados
         if st.session_state.analisis:
             ligas_acum = sorted(set(a.get("liga_nombre", a.get("liga", "?"))
                                     for a in st.session_state.analisis))
@@ -705,7 +713,6 @@ with t2:
     st.caption("Encadena apuestas con cuota fija (~1.40) sin repetir partido "
                "ni solapar horarios.")
 
-    # Mostrar ligas acumuladas
     ligas_acum = sorted(set(a.get("liga_nombre", a.get("liga", "?"))
                             for a in st.session_state.analisis))
     if ligas_acum:
@@ -951,28 +958,34 @@ with t4:
 
 
 with t5:
-    st.subheader("📚 Historial")
+    st.subheader("💰 Value Bets")
+    st.caption("Picks con **edge > 3%** — los que tienen valor apostable.")
+
     rend = stats_rendimiento()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("✅ Ganados", rend["ganados"])
     c2.metric("❌ Perdidos", rend["perdidos"])
     c3.metric("⭕ Anulados", rend["anulados"])
     c4.metric("🎯 Hit rate", f"{rend['hit_rate']}%")
+
     if rend["por_mercado"]:
         with st.expander("📊 Rendimiento por mercado"):
             for m in rend["por_mercado"]:
                 st.write(f"**{m['mercado']}** — ✅ {m['ganados']} · ❌ {m['perdidos']} "
                          f"· ⭕ {m['anulados']} → Hit **{m['hit']}%**")
+
     st.divider()
+
     filtro = st.radio("Filtrar:",
                       ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
-                      horizontal=True)
+                      horizontal=True, key="filtro_value")
     estado = None if filtro == "Todos" else filtro
-    picks = listar_picks(estado=estado)
+    picks = listar_picks(estado=estado, limite=500, solo_value=True)
+
     if not picks:
-        st.info(f"No hay picks con estado **{filtro}**")
+        st.info(f"No hay Value Bets con estado **{filtro}**")
     else:
-        st.caption(f"Mostrando {len(picks)} picks")
+        st.caption(f"Mostrando **{len(picks)}** Value Bets")
         for p in picks:
             pid = p["id"]
             with st.container(border=True):
@@ -986,6 +999,9 @@ with t5:
                     c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
                     c3.metric("C. real",
                               f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
+                    edge = p.get("edge_pct") or 0
+                    if edge > 3:
+                        st.success(f"✅ Edge: +{edge:.1f}%")
                     est = p["estado"]
                     iconos = {"GANADO": "✅", "PERDIDO": "❌", "ANULADO": "⭕"}
                     st.write(f"{iconos.get(est, '⏳')} **{est}**")
@@ -993,17 +1009,70 @@ with t5:
                     st.write("**Cambiar estado:**")
                     b1, b2, b3 = st.columns(3)
                     with b1:
-                        if st.button("✅", key=f"g_{pid}", use_container_width=True):
+                        if st.button("✅", key=f"gv_{pid}", use_container_width=True):
                             cambiar_estado(pid, "GANADO")
                             st.rerun()
                     with b2:
-                        if st.button("❌", key=f"p_{pid}", use_container_width=True):
+                        if st.button("❌", key=f"pv_{pid}", use_container_width=True):
                             cambiar_estado(pid, "PERDIDO")
                             st.rerun()
                     with b3:
-                        if st.button("⭕", key=f"a_{pid}", use_container_width=True):
+                        if st.button("⭕", key=f"av_{pid}", use_container_width=True):
                             cambiar_estado(pid, "ANULADO")
                             st.rerun()
-                    if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
+                    if st.button("🗑️ Eliminar", key=f"dv_{pid}", use_container_width=True):
+                        eliminar_pick(pid)
+                        st.rerun()
+
+
+with t6:
+    st.subheader("🎲 Otras Apuestas")
+    st.caption("Picks sin edge (o edge bajo). Útiles como referencia.")
+
+    filtro = st.radio("Filtrar:",
+                      ["Todos", "PENDIENTE", "GANADO", "PERDIDO", "ANULADO"],
+                      horizontal=True, key="filtro_otras")
+    estado = None if filtro == "Todos" else filtro
+    picks = listar_picks(estado=estado, limite=500, solo_value=False)
+
+    if not picks:
+        st.info(f"No hay Otras Apuestas con estado **{filtro}**")
+    else:
+        st.caption(f"Mostrando **{len(picks)}** Otras Apuestas")
+        for p in picks:
+            pid = p["id"]
+            with st.container(border=True):
+                col_info, col_acc = st.columns([3, 2])
+                with col_info:
+                    st.write(f"**{p['home']} vs {p['away']}**")
+                    st.caption(f"🕐 {p['fecha_partido']} · {p.get('liga','')}")
+                    st.write(f"🎯 {p['mercado']}: **{p['seleccion']}**")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Prob", f"{p['prob_modelo']:.0f}%")
+                    c2.metric("C. justa", f"{p['cuota_justa']:.2f}")
+                    c3.metric("C. real",
+                              f"{p['cuota_real']:.2f}" if p.get("cuota_real") else "—")
+                    edge = p.get("edge_pct")
+                    if edge is not None:
+                        st.caption(f"Edge: {edge:+.1f}%")
+                    est = p["estado"]
+                    iconos = {"GANADO": "✅", "PERDIDO": "❌", "ANULADO": "⭕"}
+                    st.write(f"{iconos.get(est, '⏳')} **{est}**")
+                with col_acc:
+                    st.write("**Cambiar estado:**")
+                    b1, b2, b3 = st.columns(3)
+                    with b1:
+                        if st.button("✅", key=f"go_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "GANADO")
+                            st.rerun()
+                    with b2:
+                        if st.button("❌", key=f"po_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "PERDIDO")
+                            st.rerun()
+                    with b3:
+                        if st.button("⭕", key=f"ao_{pid}", use_container_width=True):
+                            cambiar_estado(pid, "ANULADO")
+                            st.rerun()
+                    if st.button("🗑️ Eliminar", key=f"do_{pid}", use_container_width=True):
                         eliminar_pick(pid)
                         st.rerun()
