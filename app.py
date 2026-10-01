@@ -1,4 +1,4 @@
-"""LuciSport AI — Fase 1 con escaleras guardadas + fix mercado."""
+"""LuciSport AI — versión completa con persistencia."""
 import json, math, time, requests, streamlit as st
 from datetime import datetime, timedelta, timezone
 from supabase import create_client
@@ -196,6 +196,53 @@ def eliminar_escalera(esc_id):
         st.warning(f"Error eliminando: {e}")
 
 
+def reconstruir_analisis_desde_bd():
+    """
+    Lee todos los picks PENDIENTES de Supabase y reconstruye
+    el st.session_state.analisis agrupándolos por partido.
+    """
+    try:
+        rows = (get_supabase()
+                .table("picks")
+                .select("*")
+                .eq("estado", "PENDIENTE")
+                .order("fecha_partido", desc=False)
+                .limit(500)
+                .execute()
+                .data or [])
+    except Exception as e:
+        st.warning(f"No se pudo reconstruir: {e}")
+        return []
+
+    if not rows:
+        return []
+
+    partidos_dict = {}
+    for r in rows:
+        key = f"{r['home']} vs {r['away']}_{r['fecha_partido']}"
+        if key not in partidos_dict:
+            partidos_dict[key] = {
+                "partido": f"{r['home']} vs {r['away']}",
+                "fecha": r.get("fecha_partido", ""),
+                "liga": r.get("liga", ""),
+                "liga_nombre": r.get("liga", ""),
+                "picks": [],
+                "ia": None,
+                "error": None,
+            }
+        partidos_dict[key]["picks"].append({
+            "market": r["mercado"],
+            "selection": r["seleccion"],
+            "prob": r["prob_modelo"],
+            "fair_odd": r["cuota_justa"],
+            "cuota_real": r.get("cuota_real"),
+            "edge_%": r.get("edge_pct"),
+            "stake_sug": r.get("stake_sug"),
+        })
+
+    return list(partidos_dict.values())
+
+
 def poisson(lam, k):
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
@@ -350,7 +397,6 @@ def get_odds_oddsapi(match):
     return {k: v for k, v in out.items() if v}
     
 
-
 def analizar(match, liga_codigo):
     h, a = match['homeTeam']['name'], match['awayTeam']['name']
     hs = get_team_data(match['homeTeam']['id'])
@@ -458,6 +504,17 @@ if "analisis" not in st.session_state:
     st.session_state.analisis = []
 if "boleto" not in st.session_state:
     st.session_state.boleto = []
+if "analisis_cargado" not in st.session_state:
+    st.session_state.analisis_cargado = False
+
+
+# Recuperar análisis de Supabase la primera vez
+if not st.session_state.analisis_cargado:
+    with st.spinner("Recuperando análisis guardados..."):
+        recuperados = reconstruir_analisis_desde_bd()
+    if recuperados:
+        st.session_state.analisis = recuperados
+    st.session_state.analisis_cargado = True
 
 
 with st.sidebar:
@@ -471,8 +528,14 @@ with st.sidebar:
     if st.button("📥 Cargar partidos", use_container_width=True, type="primary"):
         with st.spinner("Cargando..."):
             st.session_state.partidos = cargar_partidos(liga_codigo, dias)
-            st.session_state.analisis = []
         st.rerun()
+
+    if st.button("🔄 Recargar análisis desde BD", use_container_width=True):
+        st.session_state.analisis = []
+        st.session_state.analisis_cargado = False
+        st.toast("Recargando...")
+        st.rerun()
+
     st.divider()
     s = stats_por_estado()
     st.caption(
@@ -480,10 +543,13 @@ with st.sidebar:
         f"{s.get('GANADO', 0)} gan · {s.get('PERDIDO', 0)} per · "
         f"{s.get('ANULADO', 0)} anul"
     )
+    st.caption(f"🧠 Análisis en memoria: **{len(st.session_state.analisis)}** partidos")
+
     with st.expander("🔬 Debug APIs"):
         st.caption(f"Supabase: `{_limpiar_url(_get('SUPABASE_URL',''))[:35]}...`")
         st.caption(f"Odds API: {len(ODDS_KEYS)} keys")
         st.caption(f"Groq: {'✅' if GROQ_KEY else '❌'}")
+
     st.divider()
     st.subheader("🧾 Boleto")
     if not st.session_state.boleto:
@@ -547,6 +613,8 @@ with t1:
                                 "fecha": (m.get('utcDate') or '')[:16],
                                 "picks": picks,
                                 "ia": ia,
+                                "liga": liga_codigo,
+                                "liga_nombre": liga_nombre,
                                 "error": None,
                             })
                         except Exception as e:
@@ -556,12 +624,27 @@ with t1:
                                 "fecha": "",
                                 "picks": [],
                                 "ia": None,
+                                "liga": liga_codigo,
+                                "liga_nombre": liga_nombre,
                                 "error": f"{type(e).__name__}: {e}",
                                 "traceback": traceback.format_exc(),
                             })
-                st.session_state.analisis = res
-                st.success(f"✅ {len(res)} partidos analizados")
+                # Evitar duplicados
+                partes_nuevos = {a["partido"] for a in res}
+                previos = [a for a in st.session_state.analisis
+                           if a.get("partido") not in partes_nuevos]
+                st.session_state.analisis = previos + res
+                st.success(f"✅ {len(res)} partidos analizados. "
+                           f"Total acumulado: {len(st.session_state.analisis)}")
                 st.rerun()
+
+        # Mostrar todos los análisis acumulados
+        if st.session_state.analisis:
+            ligas_acum = sorted(set(a.get("liga_nombre", a.get("liga", "?"))
+                                    for a in st.session_state.analisis))
+            st.caption(f"📊 Análisis acumulados de **{len(ligas_acum)}** liga(s): "
+                       f"_{', '.join(ligas_acum)}_")
+
         for a in st.session_state.analisis:
             if a.get("error"):
                 st.error(f"❌ {a['partido']}: {a['error']}")
@@ -570,7 +653,7 @@ with t1:
                 continue
             with st.container(border=True):
                 st.subheader(a["partido"])
-                st.caption(f"🕐 {a['fecha']}")
+                st.caption(f"🕐 {a['fecha']} · {a.get('liga_nombre', a.get('liga',''))}")
                 c1, c2 = st.columns(2)
                 with c1:
                     st.markdown("#### 📈 Picks del modelo")
@@ -621,6 +704,17 @@ with t2:
     st.subheader("🔺 Reto Escalera")
     st.caption("Encadena apuestas con cuota fija (~1.40) sin repetir partido "
                "ni solapar horarios.")
+
+    # Mostrar ligas acumuladas
+    ligas_acum = sorted(set(a.get("liga_nombre", a.get("liga", "?"))
+                            for a in st.session_state.analisis))
+    if ligas_acum:
+        st.info(f"📊 Picks acumulados de **{len(ligas_acum)}** liga(s): "
+                f"_{', '.join(ligas_acum)}_ · "
+                f"**{len(st.session_state.analisis)}** partidos")
+    else:
+        st.warning("👈 No hay análisis. Analiza partidos de una o más ligas primero.")
+
     c1, c2, c3 = st.columns(3)
     with c1:
         stake_inicial = st.number_input("Stake inicial ($)", min_value=1.0,
@@ -649,7 +743,6 @@ with t2:
                f"(x{capital/stake_inicial:.1f} sobre el inicial)")
 
     st.divider()
-
     tolerancia = st.slider("Tolerancia en la cuota (±)", 0.02, 0.20, 0.10, 0.01)
 
     mejor_por_partido = {}
@@ -664,6 +757,8 @@ with t2:
                         **p,
                         "partido": a["partido"],
                         "fecha": a["fecha"],
+                        "liga": a.get("liga", "?"),
+                        "liga_nombre": a.get("liga_nombre", "?"),
                         "cuota_ref": cuota_ref,
                         "distancia": dist,
                     }
@@ -676,6 +771,7 @@ with t2:
                          expanded=False):
             for i, p in enumerate(candidatos_esc[:20]):
                 st.write(f"• **[{p['market']}] {p['selection']}** — {p['partido']} "
+                         f"_{p.get('liga_nombre', p.get('liga','?'))}_ "
                          f"({p['fecha'][11:16]}) @{p['cuota_ref']:.2f} "
                          f"[{p['prob']}%]")
     else:
@@ -711,6 +807,7 @@ with t2:
                 capital_despues = capital * cuota_paso
                 simulacion.append({
                     "Paso": i,
+                    "Liga": p.get("liga", "?"),
                     "Mercado": p["market"],
                     "Pick": p["selection"],
                     "Partido": p["partido"],
@@ -768,8 +865,9 @@ with t2:
                 msg += f"Stake: ${sim['stake_inicial']:.2f} | Pasos: {sim['n_pasos']}\n"
                 msg += f"Cuota objetivo: {sim['cuota_escalera']}\n\n"
                 for s in sim["simulacion"]:
-                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}): "
-                            f"[{s['Mercado']}] {s['Pick']}\n"
+                    msg += (f"*Paso {s['Paso']}* ({s['Hora']}) "
+                            f"[{s.get('Liga', '?')}]\n"
+                            f"  [{s['Mercado']}] {s['Pick']}\n"
                             f"  _{s['Partido']}_\n"
                             f"  @{s['Cuota']} → ${s['Capital después']:.2f}\n\n")
                 msg += f"💰 Final: *${sim['capital_final']:.2f}*\n_LuciSport AI_"
@@ -820,8 +918,9 @@ with t3:
                     pasos = esc.get("pasos", [])
                     for p in pasos:
                         mercado = p.get('Mercado') or p.get('market') or "—"
+                        liga_p = p.get('Liga', esc.get('liga_inicio', '?'))
                         st.write(f"**Paso {p.get('Paso', '?')}** "
-                                 f"({p.get('Hora', '?')})")
+                                 f"({p.get('Hora', '?')}) [{liga_p}]")
                         st.write(f"[{mercado}] {p.get('Pick', p.get('selection', '?'))}")
                         st.caption(f"{p.get('Partido', '?')} — "
                                    f"@{p.get('Cuota', 0)} → "
@@ -908,4 +1007,3 @@ with t5:
                     if st.button("🗑️ Eliminar", key=f"d_{pid}", use_container_width=True):
                         eliminar_pick(pid)
                         st.rerun()
-
